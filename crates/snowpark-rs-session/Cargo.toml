@@ -1,0 +1,17 @@
+[package]
+name = "snowpark-rs-session"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+arrow-ipc = "59"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+pyo3 = { version = "0.28.2", features = ["abi3-py313"] }
+snowpark-rs = { path = "../..", features = ["session"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }

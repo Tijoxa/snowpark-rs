@@ -1,0 +1,52 @@
+[package]
+name = "snowpark-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[workspace]
+members = ["crates/snowflake-ast", "crates/snowpark-rs-session"]
+default-members = [".", "crates/snowflake-ast"]
+resolver = "3"
+
+[features]
+python = ["dep:pyo3"]
+session = [
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-schema",
+    "dep:arrow-select",
+    "dep:async-stream",
+    "dep:chrono",
+    "dep:dirs",
+    "dep:futures-util",
+    "dep:serde",
+    "dep:snowflake-connector-rs",
+    "dep:thiserror",
+    "dep:toml",
+]
+
+[dependencies]
+arrow-array = { version = "59", optional = true }
+arrow-buffer = { version = "59", optional = true }
+arrow-schema = { version = "59", optional = true }
+arrow-select = { version = "59", optional = true }
+async-stream = { version = "0.3", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false }
+dirs = { version = "6", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+pyo3 = { version = "0.28.2", optional = true, features = ["abi3-py313"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+snowflake-ast = { path = "crates/snowflake-ast" }
+snowflake-connector-rs = { version = "1.1.1", optional = true }
+thiserror = { version = "2", optional = true }
+toml = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time"] }
+
+[[test]]
+name = "snowflake_smoke"
+required-features = ["session"]

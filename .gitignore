@@ -1,0 +1,8 @@
+/target
+.venv/
+__pycache__/
+/src/snowpark_rs/*.pyd
+/src/snowpark_rs/*.so
+/crates/snowpark-rs-session/*_snowpark_rs_session*.pyd
+/crates/snowpark-rs-session/*_snowpark_rs_session*.so
+plan.md
