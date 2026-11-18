@@ -1,7 +1,7 @@
 import pytest
 
 from snowpark_rs import DataFrame
-from snowpark_rs.functions import col, lit
+from snowpark_rs.functions import col, count, lit, sum
 
 
 @pytest.mark.parametrize(
@@ -79,3 +79,53 @@ def test_pipe_propagates_callback_exceptions():
         frame.pipe(fail)
 
     assert raised.value is error
+
+
+def test_relational_aggregation_through_python():
+    frame = DataFrame.table("example").filter(col("id").gt(lit(5)))
+
+    sql, binds = (
+        frame.group_by(iter(["category"]))
+        .agg([count("*").alias("total_rows"), count("amount").alias("present"), sum("amount").alias("total")])
+        .sort("category")
+        .limit(n=2)
+        .to_sql()
+    )
+
+    assert 'COUNT(*) AS "TOTAL_ROWS", COUNT(t0."AMOUNT") AS "PRESENT"' in sql
+    assert 'SUM(t0."AMOUNT") AS "TOTAL"' in sql
+    assert sql.endswith('GROUP BY 1) AS t1\nORDER BY t1."CATEGORY" ASC NULLS LAST\nLIMIT 2')
+    assert binds == [5]
+    assert frame.agg(("amount", "sum")).to_sql() == frame.group_by().agg({"amount": "SUM"}).to_sql()
+
+
+def test_relational_sort_directions_and_validation():
+    frame = DataFrame.table("example")
+
+    sql, _ = frame.sort("amount", "id", ascending=[0, True]).limit(3, offset=1).to_sql()
+    assert sql.endswith('ORDER BY t0."AMOUNT" DESC NULLS FIRST, t0."ID" ASC NULLS LAST\nLIMIT 3 OFFSET 1')
+    assert frame.sort(col("amount").asc_nulls_first()).to_sql()[0].endswith(
+        't0."AMOUNT" ASC NULLS FIRST'
+    )
+    assert frame.sort().to_sql()[0].endswith("ORDER BY ALL")
+    with pytest.raises(ValueError, match="one value per sort key"):
+        frame.sort("id", "amount", ascending=[False])
+    with pytest.raises(ValueError, match="intermediate sort"):
+        frame.sort("id").filter(col("id").is_not_null()).to_sql()
+
+
+def test_relational_join_uses_exported_columns_and_ordered_binds():
+    frame = DataFrame.table("example")
+    left = frame.filter(col("id").gt(lit(1))).select(["id"])
+    right = frame.filter(col("id").lt(lit(7))).select(["id"])
+    predicate = left["id"].eq(right.col("id")) & right["id"].ne(lit(3))
+
+    sql, binds = left.join(right, on=predicate, rsuffix="_right").select(
+        [lit(True).alias("flag"), "id", "id_right"]
+    ).to_sql()
+
+    assert 'ON (t1."ID" = t3."ID") AND (t3."ID" <> ?)' in sql
+    assert sql.startswith('SELECT ? AS "FLAG", t4."ID", t4."ID_RIGHT"')
+    assert binds == [True, 1, 7, 3]
+    with pytest.raises(ValueError, match="ambiguous"):
+        left.join(right, col("id").eq(right["id"])).to_sql()

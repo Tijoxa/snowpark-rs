@@ -8,6 +8,6 @@ mod plan;
 mod query;
 
 pub use compile::CompileError;
-pub use dataframe::DataFrame;
-pub use expr::{Column, Projection, col, lit};
+pub use dataframe::{DataFrame, GroupedDataFrame};
+pub use expr::{Column, Projection, SortKey, col, count, count_all, lit, sum};
 pub use query::{BindValue, CompiledQuery};

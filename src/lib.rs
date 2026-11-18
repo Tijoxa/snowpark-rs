@@ -19,10 +19,13 @@ mod python;
 #[cfg(feature = "session")]
 pub mod session;
 
-pub use dataframe::DataFrame;
+pub use dataframe::{DataFrame, GroupedDataFrame};
 #[cfg(feature = "session")]
 pub use session::Session;
-pub use snowflake_ast::{BindValue, Column, CompileError, CompiledQuery, Projection, col, lit};
+pub use snowflake_ast::{
+    BindValue, Column, CompileError, CompiledQuery, Projection, SortKey, col, count, count_all,
+    lit, sum,
+};
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

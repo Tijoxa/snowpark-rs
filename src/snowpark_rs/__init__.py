@@ -1,11 +1,11 @@
 from typing import TYPE_CHECKING
 
-from ._core import Column, DataFrame, Projection
+from ._core import Column, DataFrame, Projection, RelationalGroupedDataFrame, SortKey
 
 if TYPE_CHECKING:
     from ._session import Session as Session
 
-__all__ = ["Column", "DataFrame", "Projection"]
+__all__ = ["Column", "DataFrame", "Projection", "RelationalGroupedDataFrame", "SortKey"]
 
 
 def __getattr__(name: str) -> object:

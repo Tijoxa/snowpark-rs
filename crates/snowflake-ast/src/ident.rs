@@ -7,6 +7,16 @@ use crate::CompileError;
 pub(crate) struct Ident(String);
 
 impl Ident {
+    pub(crate) fn with_prefix(&self, prefix: &str) -> Self {
+        let tail: String = self.0.chars().take(255 - prefix.len()).collect();
+        Self(format!("{prefix}{tail}"))
+    }
+
+    pub(crate) fn with_suffix(&self, suffix: &str) -> Result<Self, CompileError> {
+        let name = format!("{}{}", self.0, suffix.to_ascii_uppercase());
+        Self::parse(&Self(name).to_string())
+    }
+
     pub(crate) fn parse(input: &str) -> Result<Self, CompileError> {
         let invalid = || CompileError::InvalidIdentifier(input.to_owned());
         let name = if let Some(quoted) = input.strip_prefix('"') {

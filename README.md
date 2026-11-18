@@ -27,6 +27,29 @@ values. `frame.pipe(function, *args, **kwargs)` passes the frame as the
 function's first argument and returns its result. Run the tests with
 `uv run pytest`.
 
+### Group, sort, and join
+
+```python
+from snowpark_rs.functions import count, sum
+
+source = DataFrame.table("PUBLIC.PUBLIC.EXAMPLE")
+totals = (
+    source.group_by("category")
+    .agg(count("*").alias("rows"), sum("amount").alias("total"))
+    .sort(col("total").desc_nulls_last())
+    .limit(10)
+)
+
+left = source.select(["id", "name"])
+right = source.select(["id", "amount"])
+joined = left.join(right, left["id"].eq(right["id"]), rsuffix="_right")
+```
+
+Use `agg(...)` directly on a DataFrame for a global aggregate. A sort can end a
+query or precede a limit. Inner joins take two inputs with explicitly named
+outputs. By default, overlapping names receive deterministic `L_` and `R_`
+prefixes. Pass `lsuffix` or `rsuffix` to choose the output names.
+
 ### Execute with a Snowflake session
 
 Enable the optional backend in this checkout with `uv sync --dev --extra session`.
