@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 import pytest
 
 import snowpark_rs
-from snowpark_rs import DataFrame, _session
+from snowpark_rs import Table, _polars, _session
 from snowpark_rs.functions import col, lit
 
 
@@ -16,13 +16,15 @@ def test_offline_api_does_not_import_the_optional_backend(monkeypatch):
         raise ModuleNotFoundError(name=name)
 
     monkeypatch.setattr(_session, "import_module", missing)
-    frame = DataFrame.table("DB.SCHEMA.EXAMPLE")
+    frame = Table("DB.SCHEMA.EXAMPLE")
     assert frame.to_sql()[1] == []
     with pytest.raises(ImportError, match=r"snowpark-rs\[session\]"):
         _ = snowpark_rs.Session
 
 
-def test_session_arrow_end_to_end(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_polars", [False, True], ids=["arrow", "polars"])
+def test_session_arrow_end_to_end(tmp_path, monkeypatch, with_polars):
+    polars = pytest.importorskip("polars") if with_polars else None
     pyarrow = pytest.importorskip("pyarrow")
     pytest.importorskip("_snowpark_rs_session")
     from snowpark_rs import Session
@@ -98,7 +100,7 @@ def test_session_arrow_end_to_end(tmp_path, monkeypatch):
             session = Session.builder.config("connection_name", "data").create()
             empty_session = Session.builder.config("connection_name", "empty").create()
             broken_session = Session.builder.config("connection_name", "broken").create()
-            frame = DataFrame.table("DB.SCHEMA.EXAMPLE").filter(col("FLAG").eq(lit(True)))
+            frame = Table("DB.SCHEMA.EXAMPLE").filter(col("FLAG").eq(lit(True)))
 
             iterator = frame.to_arrow_batches(session)
             assert downloads == []
@@ -134,8 +136,39 @@ def test_session_arrow_end_to_end(tmp_path, monkeypatch):
                 next(broken)
             assert list(broken) == []
 
+            if polars is not None:
+                downloads_before = list(downloads)
+                batches = frame.to_polars(session, use_batches=True)
+                assert downloads == downloads_before
+                first_batch = next(batches)
+                assert downloads == downloads_before
+                (last_batch,) = batches
+                assert downloads == [*downloads_before, "/batch"]
+                assert first_batch["AMOUNT"].to_list() == [
+                    Decimal("123456789012345678901234567890.12")
+                ]
+                assert last_batch["AMOUNT"].to_list() == [Decimal("-0.25")]
+
+                materialized = frame.to_polars(session)
+                assert isinstance(materialized, polars.DataFrame)
+                assert materialized.equals(polars.concat([first_batch, last_batch]))
+                empty_polars = frame.to_polars(empty_session)
+                assert empty_polars.is_empty()
+                assert empty_polars.schema == materialized.schema
+                assert list(frame.to_polars(empty_session, use_batches=True)) == []
+
             assert all(body["sqlText"] == frame.to_sql()[0] for _, body in queries)
             assert all(body["bindings"]["1"]["type"] == "BOOLEAN" for _, body in queries)
         finally:
             server.shutdown()
             worker.join()
+
+
+@pytest.mark.parametrize("use_batches", [False, True])
+def test_to_polars_reports_missing_optional_dependency(monkeypatch, use_batches):
+    def missing(name):
+        raise ModuleNotFoundError(name=name)
+
+    monkeypatch.setattr(_polars, "import_module", missing)
+    with pytest.raises(ImportError, match=r"snowpark-rs\[session,polars\]"):
+        Table("example").to_polars(_session.Session(object()), use_batches=use_batches)

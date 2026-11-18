@@ -5,6 +5,8 @@ use pyo3::{
     types::{PyBool, PyDict, PyInt, PyString, PyTuple},
 };
 
+use sql_dialect_fmt_formatter::{Dialect, FormatOptions, format};
+
 use crate::{BindValue, Column, CompileError, DataFrame, Projection};
 
 #[pyclass(name = "Column", module = "snowpark_rs", frozen)]
@@ -81,13 +83,17 @@ impl From<Selection<'_>> for Projection {
     }
 }
 
-#[pyclass(name = "DataFrame", module = "snowpark_rs", frozen)]
+#[pyclass(name = "DataFrame", module = "snowpark_rs", frozen, subclass)]
 struct PyDataFrame(DataFrame);
 
+/// A named Snowflake table that can be used to build queries offline.
+#[pyclass(name = "Table", module = "snowpark_rs", extends = PyDataFrame, frozen)]
+struct PyTable;
+
 #[pymethods]
-impl PyDataFrame {
-    #[staticmethod]
-    fn table(name: &Bound<'_, PyAny>) -> PyResult<Self> {
+impl PyTable {
+    #[new]
+    fn new(name: &Bound<'_, PyAny>) -> PyResult<(Self, PyDataFrame)> {
         let frame = if let Ok(name) = name.cast::<PyString>() {
             DataFrame::table_name(name.to_str()?)
         } else {
@@ -96,10 +102,14 @@ impl PyDataFrame {
                 .map(|part| part?.extract::<String>())
                 .collect::<PyResult<Vec<_>>>()?;
             DataFrame::table(parts)
-        };
-        frame.map(Self).map_err(compile_error)
+        }
+        .map_err(compile_error)?;
+        Ok((Self, PyDataFrame(frame)))
     }
+}
 
+#[pymethods]
+impl PyDataFrame {
     fn filter(&self, predicate: &PyColumn) -> Self {
         Self(self.0.filter(predicate.0.clone()))
     }
@@ -122,8 +132,16 @@ impl PyDataFrame {
         function.call(PyTuple::new(slf.py(), positional)?, kwargs)
     }
 
-    fn to_sql(&self, py: Python<'_>) -> PyResult<(String, Vec<Py<PyAny>>)> {
+    /// Return parameterized Snowflake SQL and its bind values in placeholder order.
+    #[pyo3(signature = (*, prettify = false))]
+    fn to_sql(&self, py: Python<'_>, prettify: bool) -> PyResult<(String, Vec<Py<PyAny>>)> {
         let query = self.0.to_sql().map_err(compile_error)?;
+        let sql = if prettify {
+            let options = FormatOptions::default().with_dialect(Dialect::Snowflake);
+            format(&query.sql, &options)
+        } else {
+            single_line_sql(query.sql)
+        };
         let binds = query
             .binds
             .into_iter()
@@ -133,22 +151,51 @@ impl PyDataFrame {
                 BindValue::Bool(boolean) => boolean.into_py_any(py),
             })
             .collect::<PyResult<_>>()?;
-        Ok((query.sql, binds))
+        Ok((sql, binds))
     }
 
     /// Execute with the supplied session and return a PyArrow table.
     fn to_arrow<'py>(&self, session: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let py = session.py();
         py.import("snowpark_rs._session")?
-            .call_method1("to_arrow", (session, self.to_sql(py)?))
+            .call_method1("to_arrow", (session, self.to_sql(py, false)?))
     }
 
     /// Execute with the supplied session and iterate over PyArrow tables.
     fn to_arrow_batches<'py>(&self, session: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let py = session.py();
         py.import("snowpark_rs._session")?
-            .call_method1("to_arrow_batches", (session, self.to_sql(py)?))
+            .call_method1("to_arrow_batches", (session, self.to_sql(py, false)?))
     }
+
+    /// Convert an Arrow result to Polars, optionally one batch at a time.
+    #[pyo3(signature = (session, *, use_batches = false))]
+    fn to_polars<'py>(
+        slf: &Bound<'py, Self>,
+        session: &Bound<'py, PyAny>,
+        use_batches: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        slf.py()
+            .import("snowpark_rs._polars")?
+            .call_method1("to_polars", (slf, session, use_batches))
+    }
+}
+
+fn single_line_sql(sql: String) -> String {
+    if !sql.contains('\n') {
+        return sql;
+    }
+
+    let mut compact = String::with_capacity(sql.len());
+    // SQL whitespace can be collapsed while preserving it inside quoted identifiers.
+    for token in sql_dialect_fmt_lexer::tokenize(&sql).tokens {
+        if token.text.contains('\n') && token.text.trim().is_empty() {
+            compact.push(' ');
+        } else {
+            compact.push_str(token.text);
+        }
+    }
+    compact
 }
 
 fn compile_error(error: CompileError) -> PyErr {
@@ -180,6 +227,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyColumn>()?;
     module.add_class::<PyProjection>()?;
     module.add_class::<PyDataFrame>()?;
+    module.add_class::<PyTable>()?;
     module.add_function(wrap_pyfunction!(col, module)?)?;
     module.add_function(wrap_pyfunction!(lit, module)?)?;
     Ok(())
