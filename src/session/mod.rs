@@ -75,6 +75,9 @@ pub async fn execute_arrow_batches(
             BindValue::Text(value) => statement.bind(value),
             BindValue::Int(value) => statement.bind(value),
             BindValue::Bool(value) => statement.bind(value),
+            // The compiler casts these binds to the target Snowflake type.
+            BindValue::Decimal(value) => statement.bind(value.to_string()),
+            BindValue::Null(_) => statement.bind(Option::<String>::None),
         };
     }
     let mut cursor = session

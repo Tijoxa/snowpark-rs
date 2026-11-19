@@ -8,6 +8,7 @@ CHECKS = (
     ("uvx", "ruff", "check"),
     ("uvx", "ty", "check"),
     ("uv", "run", "--locked", "--extra", "session", "pytest"),
+    ("cargo", "fmt", "--all", "--", "--check"),
     ("cargo", "test", "--locked", "--no-default-features"),
     ("cargo", "test", "--locked", "-p", "snowpark-rs", "--features", "session"),
     (

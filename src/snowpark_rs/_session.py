@@ -37,7 +37,8 @@ class _SessionBuilder:
 
     def create(self) -> Session:
         backend = require_backend()
-        return Session(backend.Connection(self._connection_name))
+        connection_type = getattr(backend, "Connection")  # noqa: B009 -- defined by the extension
+        return Session(connection_type(self._connection_name))
 
 
 class _Builder:
@@ -62,7 +63,8 @@ class _NativeConnection(Protocol):
 
 def _connection(session: Session) -> _NativeConnection:
     backend = require_backend()
-    if not isinstance(session, Session) or not isinstance(session._connection, backend.Connection):
+    connection_type = getattr(backend, "Connection")  # noqa: B009 -- defined by the extension
+    if not isinstance(session, Session) or not isinstance(session._connection, connection_type):
         raise TypeError("session must be a snowpark_rs.Session")
     return cast(_NativeConnection, session._connection)
 

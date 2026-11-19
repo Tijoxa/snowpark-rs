@@ -8,7 +8,7 @@ use pyo3::{
     types::{PyBool, PyBytes, PyInt, PyString},
 };
 use snowpark_rs::{
-    BindValue, CompiledQuery, Session,
+    BindValue, CompiledQuery, DataType, Decimal, Session,
     session::{ArrowBatches, RecordBatch, connect_profile, execute_arrow, execute_arrow_batches},
 };
 use tokio::runtime::Runtime;
@@ -103,9 +103,19 @@ fn compiled_query(sql: String, binds: Vec<Bound<'_, PyAny>>) -> PyResult<Compile
                 value.extract().map(BindValue::Int)
             } else if value.is_instance_of::<PyString>() {
                 value.extract().map(BindValue::Text)
+            } else if value.is_none() {
+                // The target type is carried by the CAST in the compiled SQL.
+                Ok(BindValue::Null(DataType::Varchar))
+            } else if value.is_instance(&value.py().import("decimal")?.getattr("Decimal")?)? {
+                value
+                    .str()?
+                    .to_str()?
+                    .parse::<Decimal>()
+                    .map(BindValue::Decimal)
+                    .map_err(|error| PyTypeError::new_err(error.to_string()))
             } else {
                 Err(PyTypeError::new_err(
-                    "expected a str, int, or bool bind value",
+                    "expected a str, int, bool, Decimal, or None bind value",
                 ))
             }
         })

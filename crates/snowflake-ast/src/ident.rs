@@ -3,10 +3,28 @@ use std::fmt;
 use crate::CompileError;
 
 /// A resolved Snowflake identifier with its original quoting semantics.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Ident(String);
 
 impl Ident {
+    pub(crate) fn normalized(&self) -> String {
+        if Self::parse(&self.0).as_ref() == Ok(self) {
+            self.0.clone()
+        } else {
+            self.to_string()
+        }
+    }
+
+    pub(crate) fn with_prefix(&self, prefix: &str) -> Self {
+        let tail: String = self.0.chars().take(255 - prefix.len()).collect();
+        Self(format!("{prefix}{tail}"))
+    }
+
+    pub(crate) fn with_suffix(&self, suffix: &str) -> Result<Self, CompileError> {
+        let name = format!("{}{}", self.0, suffix.to_ascii_uppercase());
+        Self::parse(&Self(name).to_string())
+    }
+
     pub(crate) fn parse(input: &str) -> Result<Self, CompileError> {
         let invalid = || CompileError::InvalidIdentifier(input.to_owned());
         let name = if let Some(quoted) = input.strip_prefix('"') {

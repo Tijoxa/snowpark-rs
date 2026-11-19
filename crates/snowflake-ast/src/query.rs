@@ -1,11 +1,21 @@
 use std::fmt;
 
+use crate::{DataType, Decimal};
+
 /// A value bound to a Snowflake SQL placeholder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BindValue {
     Text(String),
     Int(i64),
     Bool(bool),
+    Null(DataType),
+    Decimal(Decimal),
+}
+
+impl From<Decimal> for BindValue {
+    fn from(value: Decimal) -> Self {
+        Self::Decimal(value)
+    }
 }
 
 impl From<&str> for BindValue {
