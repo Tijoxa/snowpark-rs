@@ -15,6 +15,21 @@ pub struct DataFrame {
 }
 
 impl DataFrame {
+    /// Resolve a frontend transformation when compilation first needs its plan.
+    #[doc(hidden)]
+    pub fn defer(
+        &self,
+        lower: impl Fn(&Self) -> Result<Self, CompileError> + Send + Sync + 'static,
+    ) -> Self {
+        let input = self.clone();
+        Self {
+            plan: Arc::new(LogicalPlan::Deferred {
+                lower: Box::new(move || lower(&input).map(|frame| frame.plan)),
+                resolved: Default::default(),
+            }),
+        }
+    }
+
     /// Read a table by its name, `[schema, table]` or `[database, schema, table]`.
     pub fn table(parts: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self, CompileError> {
         Ok(Self {
@@ -192,11 +207,25 @@ impl DataFrame {
     }
 
     /// Reference a column exported by this frame in a join condition.
+    pub fn select_scalar(&self, projections: Vec<Projection>) -> Self {
+        Self {
+            plan: Arc::new(LogicalPlan::ScalarProject {
+                input: Arc::clone(&self.plan),
+                projections,
+            }),
+        }
+    }
+
     pub fn col(&self, name: impl Into<String>) -> Column {
         Column(Expr::Reference {
             name: name.into(),
             relation: Some(Arc::clone(&self.plan)),
         })
+    }
+
+    /// Test membership in the output of a single-column query.
+    pub fn membership(&self, value: Column) -> Column {
+        Column(Expr::InQuery(Box::new(value.0), Arc::clone(&self.plan)))
     }
 
     /// Group rows by the supplied keys before aggregating.

@@ -3,11 +3,11 @@ from decimal import Decimal
 from types import ModuleType
 from unittest.mock import Mock
 
+import polars as pl
 import pytest
 
 import snowpark_rs
-from snowpark_rs import Table, _polars, _session
-from snowpark_rs.functions import col, lit
+from snowpark_rs import Table, UnsupportedPolarsExpression, _session
 
 
 class MockConnection:
@@ -37,23 +37,17 @@ def open_session(monkeypatch):
 
 @pytest.fixture
 def frame():
-    return Table("DB.SCHEMA.EXAMPLE").filter(col("FLAG").eq(lit(True)))
+    return Table("DB.SCHEMA.EXAMPLE").filter(pl.col("FLAG").eq(True))
 
 
 @pytest.fixture
 def arrow_result():
     pa = pytest.importorskip("pyarrow")
-    timestamp = pa.struct(
-        [
-            pa.field("timestamp", pa.timestamp("ms", tz="UTC"), nullable=False),
-            pa.field("offset_seconds", pa.int32(), nullable=False),
-        ]
-    )
     schema = pa.schema(
         [
             pa.field("AMOUNT", pa.decimal128(38, 2), nullable=False),
             pa.field("FLAG", pa.bool_()),
-            pa.field("TIME", timestamp),
+            pa.field("CREATED_AT_TZ", pa.timestamp("ns", tz="UTC")),
         ]
     )
     return pa.Table.from_pylist(
@@ -61,9 +55,9 @@ def arrow_result():
             {
                 "AMOUNT": Decimal("123456789012345678901234567890.12"),
                 "FLAG": None,
-                "TIME": {"timestamp": 0, "offset_seconds": 3600},
+                "CREATED_AT_TZ": 123_456_789,
             },
-            {"AMOUNT": Decimal("-0.25"), "FLAG": True, "TIME": None},
+            {"AMOUNT": Decimal("-0.25"), "FLAG": True, "CREATED_AT_TZ": None},
         ],
         schema=schema,
     )
@@ -89,6 +83,22 @@ def test_offline_api_does_not_import_the_optional_backend(monkeypatch):
         _ = snowpark_rs.Session
 
 
+def test_unsupported_polars_expression_fails_before_using_the_session(open_session):
+    session, connection = open_session()
+    frame = Table("T").filter(pl.col("X").rolling_sum(2) > 10)
+
+    with pytest.raises(
+        UnsupportedPolarsExpression, match="filter: Function.RollingExpr"
+    ):
+        frame.to_polars(session)
+    with pytest.raises(
+        UnsupportedPolarsExpression, match="filter: Function.RollingExpr"
+    ):
+        frame.to_polars(session, use_batches=True)
+    connection.to_arrow.assert_not_called()
+    connection.to_arrow_batches.assert_not_called()
+
+
 def test_to_arrow_uses_the_explicit_session(frame, open_session, arrow_result):
     session, connection = open_session("data")
     empty_session, empty_connection = open_session()
@@ -111,15 +121,16 @@ def test_to_arrow_uses_the_explicit_session(frame, open_session, arrow_result):
     empty_connection.to_arrow_batches.assert_called_once_with(*query)
 
 
-def test_schema_with_session_reads_zero_rows_and_passes_exact_binds(open_session, arrow_result):
+def test_schema_with_session_reads_zero_rows_and_passes_exact_binds(
+    open_session, arrow_result
+):
     session, connection = open_session()
     empty = arrow_result.select(["AMOUNT", "FLAG"]).slice(0, 0)
     connection.to_arrow.return_value = _arrow_ipc(empty)
     amount = Decimal("123456789012345678901234567890.12")
-    frame = Table("example").select([
-        lit(amount).alias("amount"),
-        lit(None, "boolean").alias("flag"),
-    ])
+    frame = Table("example").select(
+        AMOUNT=pl.lit(amount), FLAG=pl.lit(None, pl.Boolean)
+    )
 
     assert frame.schema_with_session(session) == empty.schema
     sql, binds = connection.to_arrow.call_args.args
@@ -187,7 +198,6 @@ def test_to_arrow_batches_propagates_errors_during_iteration(
 def test_to_polars_converts_materialized_and_batched_ipc(
     frame, open_session, arrow_result
 ):
-    polars = pytest.importorskip("polars")
     session, connection = open_session("polars")
     connection.to_arrow.return_value = _arrow_ipc(arrow_result)
     first = arrow_result.slice(0, 1)
@@ -201,9 +211,11 @@ def test_to_polars_converts_materialized_and_batched_ipc(
     connection.to_arrow_batches.return_value = read_batches()
 
     materialized = frame.to_polars(session)
-    assert isinstance(materialized, polars.DataFrame)
+    assert isinstance(materialized, pl.DataFrame)
     assert materialized["AMOUNT"].to_list() == arrow_result["AMOUNT"].to_pylist()
     assert materialized["FLAG"].to_list() == [None, True]
+    assert materialized.schema["CREATED_AT_TZ"] == pl.Datetime("ns", "UTC")
+    assert materialized["CREATED_AT_TZ"].cast(pl.Int64).to_list() == [123_456_789, None]
 
     batches = frame.to_polars(session, use_batches=True)
     read_last.assert_not_called()
@@ -212,7 +224,7 @@ def test_to_polars_converts_materialized_and_batched_ipc(
     (last_batch,) = batches
     read_last.assert_called_once_with()
     assert [first_batch.height, last_batch.height] == [1, 1]
-    assert materialized.equals(polars.concat([first_batch, last_batch]))
+    assert materialized.equals(pl.concat([first_batch, last_batch]))
 
     empty_session, empty_connection = open_session("empty")
     empty_connection.to_arrow.return_value = _arrow_ipc(arrow_result.slice(0, 0))
@@ -221,13 +233,3 @@ def test_to_polars_converts_materialized_and_batched_ipc(
     assert empty.is_empty()
     assert empty.schema == materialized.schema
     assert list(frame.to_polars(empty_session, use_batches=True)) == []
-
-
-def test_to_polars_reports_missing_optional_dependency(monkeypatch, open_session):
-    def missing(name):
-        raise ModuleNotFoundError(name=name)
-
-    monkeypatch.setattr(_polars, "import_module", missing)
-    session, _ = open_session()
-    with pytest.raises(ImportError, match=r"snowpark-rs\[session,polars\]"):
-        Table("example").to_polars(session)

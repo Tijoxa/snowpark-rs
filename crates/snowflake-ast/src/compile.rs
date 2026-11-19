@@ -8,8 +8,14 @@ use crate::{
 };
 
 /// An invalid name, expression or column reference in a DataFrame plan.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CompileError {
+    #[error("{operation}: {node}: {reason}")]
+    UnsupportedExpression {
+        operation: &'static str,
+        node: String,
+        reason: String,
+    },
     #[error("invalid Snowflake identifier {0:?}")]
     InvalidIdentifier(String),
     #[error("table names must contain one to three separate identifier parts")]
@@ -56,6 +62,8 @@ pub enum CompileError {
     UnionArity { left: usize, right: usize },
     #[error("union by name inputs have different column names")]
     UnionNames,
+    #[error("is_in requires a single-column query, got {0} columns")]
+    MembershipArity(usize),
 }
 
 pub(crate) fn compile(plan: &LogicalPlan) -> Result<CompiledQuery, CompileError> {
@@ -95,6 +103,9 @@ impl Compiler {
 
     fn block(&mut self, plan: &LogicalPlan) -> Result<Block, CompileError> {
         match plan {
+            LogicalPlan::Deferred { lower, resolved } => {
+                self.block(resolved.get_or_init(lower).as_ref().map_err(Clone::clone)?)
+            }
             LogicalPlan::Scan { table, schema } => Ok(self.source(
                 CompiledQuery {
                     sql: table.to_string(),
@@ -124,6 +135,21 @@ impl Compiler {
                     return Err(CompileError::EmptyProjection);
                 }
                 let mut block = self.projection_input(input)?;
+                block.projection = Some(block.scope(input).project(projections, &[])?);
+                Ok(block)
+            }
+            LogicalPlan::ScalarProject { input, projections } => {
+                if projections.is_empty() {
+                    return Err(CompileError::EmptyProjection);
+                }
+                self.block(input)?;
+                let mut block = self.source(
+                    CompiledQuery {
+                        sql: "(SELECT 1)".into(),
+                        binds: Vec::new(),
+                    },
+                    Some(Vec::new()),
+                );
                 block.projection = Some(block.scope(input).project(projections, &[])?);
                 Ok(block)
             }
@@ -658,10 +684,22 @@ impl Scope<'_> {
         query: &mut CompiledQuery,
         nested: bool,
     ) -> Result<(), CompileError> {
+        self.emit_expression(expr, query, nested, false)
+    }
+
+    fn emit_expression(
+        &self,
+        expr: &Expr,
+        query: &mut CompiledQuery,
+        nested: bool,
+        allow_aggregate: bool,
+    ) -> Result<(), CompileError> {
         let parens = nested
             && matches!(
                 expr,
                 Expr::Binary(..)
+                    | Expr::InList { .. }
+                    | Expr::InQuery(..)
                     | Expr::Negate(_)
                     | Expr::Not(_)
                     | Expr::IsNull(_)
@@ -694,45 +732,191 @@ impl Scope<'_> {
                 }
                 query.binds.push(value.clone());
             }
+            Expr::DateFromEpochDays(days) => {
+                query.sql.push_str("DATEADD(day, ?, DATE '1970-01-01')");
+                query.binds.push(BindValue::Int(*days));
+            }
+            Expr::TimestampFromEpoch(value, unit, with_timezone) => {
+                let function = if *with_timezone {
+                    "TO_TIMESTAMP_TZ"
+                } else {
+                    "TO_TIMESTAMP_NTZ"
+                };
+                query
+                    .sql
+                    .push_str(&format!("{function}(?, {})", unit.scale()));
+                query.binds.push(BindValue::Int(*value));
+            }
+            Expr::TemporalEpoch(inner, data_type) => {
+                self.emit_temporal_epoch(inner, *data_type, query, allow_aggregate)?;
+            }
+            Expr::UtcDate(inner) => {
+                query.sql.push_str("CAST(CONVERT_TIMEZONE('UTC', ");
+                self.emit_expression(inner, query, false, allow_aggregate)?;
+                query.sql.push_str(") AS DATE)");
+            }
+            Expr::InList {
+                expr,
+                values,
+                nulls_equal,
+                has_null,
+            } => {
+                self.emit_in_list(
+                    expr,
+                    values,
+                    *nulls_equal,
+                    *has_null,
+                    query,
+                    allow_aggregate,
+                )?;
+            }
+            Expr::InQuery(inner, plan) => {
+                let (subquery, columns) = Compiler::default().block(plan)?.finish();
+                if let Some(columns) = columns
+                    && columns.len() != 1
+                {
+                    return Err(CompileError::MembershipArity(columns.len()));
+                }
+                self.emit_expression(inner, query, true, allow_aggregate)?;
+                query.sql.push_str(" IN (SELECT membership_source.* FROM (");
+                query.append(subquery);
+                query.sql.push_str(") AS membership_source)");
+            }
             Expr::Binary(left, op, right) => {
-                self.emit_expr(left, query, true)?;
+                self.emit_expression(left, query, true, allow_aggregate)?;
                 query.sql.push_str(op.sql());
-                self.emit_expr(right, query, true)?;
+                self.emit_expression(right, query, true, allow_aggregate)?;
             }
             Expr::Cast(inner, data_type) => {
                 data_type.validate()?;
                 query.sql.push_str("CAST(");
-                self.emit_expr(inner, query, false)?;
+                self.emit_expression(inner, query, false, allow_aggregate)?;
                 query.sql.push_str(&format!(" AS {data_type})"));
             }
             Expr::Negate(inner) => {
                 query.sql.push_str("-(");
-                self.emit_expr(inner, query, false)?;
+                self.emit_expression(inner, query, false, allow_aggregate)?;
                 query.sql.push(')');
             }
-            Expr::Power(base, exponent) => {
-                query.sql.push_str("POWER(");
-                self.emit_expr(base, query, false)?;
+            Expr::Power(base, exponent) | Expr::Coalesce(base, exponent) => {
+                query.sql.push_str(if matches!(expr, Expr::Power(_, _)) {
+                    "POWER("
+                } else {
+                    "COALESCE("
+                });
+                self.emit_expression(base, query, false, allow_aggregate)?;
                 query.sql.push_str(", ");
-                self.emit_expr(exponent, query, false)?;
+                self.emit_expression(exponent, query, false, allow_aggregate)?;
+                query.sql.push(')');
+            }
+            Expr::TryParseJson(inner) => {
+                query.sql.push_str("TRY_PARSE_JSON(");
+                self.emit_expression(inner, query, false, allow_aggregate)?;
                 query.sql.push(')');
             }
             Expr::Not(inner) => {
                 query.sql.push_str("NOT (");
-                self.emit_expr(inner, query, false)?;
+                self.emit_expression(inner, query, false, allow_aggregate)?;
                 query.sql.push(')');
             }
             Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-                self.emit_expr(inner, query, true)?;
+                self.emit_expression(inner, query, true, allow_aggregate)?;
                 query.sql.push_str(match expr {
                     Expr::IsNull(_) => " IS NULL",
                     _ => " IS NOT NULL",
                 });
             }
+            Expr::Aggregate(aggregate) if allow_aggregate => {
+                self.emit_aggregate(aggregate, query)?
+            }
             Expr::Aggregate(_) => return Err(CompileError::UnexpectedAggregate),
         }
         if parens {
             query.sql.push(')');
+        }
+        Ok(())
+    }
+
+    fn emit_temporal_epoch(
+        &self,
+        expr: &Expr,
+        data_type: Option<DataType>,
+        query: &mut CompiledQuery,
+        allow_aggregate: bool,
+    ) -> Result<(), CompileError> {
+        if let Some(data_type) = data_type {
+            query.sql.push_str("DATE_PART(EPOCH_NANOSECOND, ");
+            if data_type == DataType::Date {
+                query.sql.push_str("CAST(");
+            }
+            self.emit_expression(expr, query, false, allow_aggregate)?;
+            if data_type == DataType::Date {
+                query.sql.push_str(" AS TIMESTAMP_NTZ)");
+            }
+            query.sql.push(')');
+        } else {
+            // AS_* keeps the timestamp's original kind when the scan schema is unknown.
+            query.sql.push_str("COALESCE(");
+            for function in ["AS_TIMESTAMP_NTZ", "AS_TIMESTAMP_LTZ", "AS_TIMESTAMP_TZ"] {
+                query.sql.push_str(&format!(
+                    "DATE_PART(EPOCH_NANOSECOND, {function}(TO_VARIANT("
+                ));
+                self.emit_expression(expr, query, false, allow_aggregate)?;
+                query.sql.push_str("))), ");
+            }
+            query
+                .sql
+                .push_str("DATE_PART(EPOCH_NANOSECOND, CAST(AS_DATE(TO_VARIANT(");
+            self.emit_expression(expr, query, false, allow_aggregate)?;
+            query.sql.push_str(")) AS TIMESTAMP_NTZ)))");
+        }
+        Ok(())
+    }
+
+    fn emit_in_list(
+        &self,
+        expr: &Expr,
+        values: &[Expr],
+        nulls_equal: bool,
+        has_null: bool,
+        query: &mut CompiledQuery,
+        allow_aggregate: bool,
+    ) -> Result<(), CompileError> {
+        if values.is_empty() {
+            if nulls_equal && has_null {
+                self.emit_expression(expr, query, true, allow_aggregate)?;
+                query.sql.push_str(" IS NULL");
+            } else {
+                query.sql.push_str("CASE WHEN ");
+                self.emit_expression(expr, query, true, allow_aggregate)?;
+                query.sql.push_str(if nulls_equal {
+                    " IS NULL THEN FALSE ELSE FALSE END"
+                } else {
+                    " IS NULL THEN NULL ELSE FALSE END"
+                });
+            }
+            return Ok(());
+        }
+        if nulls_equal {
+            query.sql.push_str("COALESCE(");
+        }
+        self.emit_expression(expr, query, true, allow_aggregate)?;
+        query.sql.push_str(" IN (");
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                query.sql.push_str(", ");
+            }
+            self.emit_expression(value, query, false, allow_aggregate)?;
+        }
+        query.sql.push(')');
+        if nulls_equal {
+            query.sql.push_str(", ");
+            if has_null {
+                self.emit_expression(expr, query, true, allow_aggregate)?;
+                query.sql.push_str(" IS NULL)");
+            } else {
+                query.sql.push_str("FALSE)");
+            }
         }
         Ok(())
     }
@@ -761,8 +945,38 @@ impl Scope<'_> {
                 BindValue::Bool(_) => (Some(DataType::Boolean), Some(false)),
                 BindValue::Text(_) => (Some(DataType::Varchar), Some(false)),
                 BindValue::Int(_) => (None, Some(false)),
+                BindValue::Float(_) => (Some(DataType::Float), Some(false)),
             },
             Expr::Cast(inner, data_type) => (Some(*data_type), self.expression_type(inner)?.1),
+            Expr::DateFromEpochDays(_) => (Some(DataType::Date), Some(false)),
+            Expr::TimestampFromEpoch(_, _, with_timezone) => (
+                Some(if *with_timezone {
+                    DataType::TimestampTz
+                } else {
+                    DataType::TimestampNtz
+                }),
+                Some(false),
+            ),
+            Expr::TemporalEpoch(inner, _) => (
+                Some(DataType::Number {
+                    precision: 38,
+                    scale: 0,
+                }),
+                self.expression_type(inner)?.1,
+            ),
+            Expr::UtcDate(inner) => (Some(DataType::Date), self.expression_type(inner)?.1),
+            Expr::InList {
+                expr, nulls_equal, ..
+            } => (
+                Some(DataType::Boolean),
+                if *nulls_equal {
+                    Some(false)
+                } else {
+                    self.expression_type(expr)?.1
+                },
+            ),
+            Expr::InQuery(..) => (Some(DataType::Boolean), None),
+            Expr::TryParseJson(_) => (Some(DataType::Variant), Some(true)),
             Expr::IsNull(_) | Expr::IsNotNull(_) => (Some(DataType::Boolean), Some(false)),
             Expr::Not(inner) => (Some(DataType::Boolean), self.expression_type(inner)?.1),
             Expr::Negate(inner) => (None, self.expression_type(inner)?.1),
@@ -770,6 +984,8 @@ impl Scope<'_> {
                 let data_type = match op {
                     BinaryOp::Eq
                     | BinaryOp::Ne
+                    | BinaryOp::EqMissing
+                    | BinaryOp::NeMissing
                     | BinaryOp::Lt
                     | BinaryOp::Le
                     | BinaryOp::Gt
@@ -780,10 +996,14 @@ impl Scope<'_> {
                 };
                 (
                     data_type,
-                    nullable_either(
-                        self.expression_type(left)?.1,
-                        self.expression_type(right)?.1,
-                    ),
+                    if matches!(op, BinaryOp::EqMissing | BinaryOp::NeMissing) {
+                        Some(false)
+                    } else {
+                        nullable_either(
+                            self.expression_type(left)?.1,
+                            self.expression_type(right)?.1,
+                        )
+                    },
                 )
             }
             Expr::Power(left, right) => (
@@ -793,8 +1013,25 @@ impl Scope<'_> {
                     self.expression_type(right)?.1,
                 ),
             ),
+            Expr::Coalesce(left, right) => {
+                let (left_type, left_nullable) = self.expression_type(left)?;
+                let (right_type, right_nullable) = self.expression_type(right)?;
+                (
+                    if left_type == right_type {
+                        left_type
+                    } else {
+                        None
+                    },
+                    match (left_nullable, right_nullable) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    },
+                )
+            }
             Expr::Aggregate(Aggregate::CountAll | Aggregate::Count(_)) => (None, Some(false)),
             Expr::Aggregate(Aggregate::Sum(_)) => (None, Some(true)),
+            Expr::Aggregate(Aggregate::SumOrZero(_)) => (None, Some(false)),
         })
     }
 
@@ -809,15 +1046,22 @@ impl Scope<'_> {
             .iter()
             .map(|projection| (projection, false))
             .chain(aggregates.iter().map(|projection| (projection, true)));
+        if aggregates
+            .iter()
+            .any(|projection| projection.expr.contains_ungrouped_reference())
+            || (keys.is_empty()
+                && !aggregates.is_empty()
+                && !aggregates
+                    .iter()
+                    .any(|projection| projection.expr.contains_aggregate()))
+        {
+            return Err(CompileError::ExpectedAggregate);
+        }
         for (index, (projection, aggregate)) in projections.enumerate() {
             if index > 0 {
                 result.sql.sql.push_str(", ");
             }
-            if aggregate {
-                self.emit_aggregate(&projection.expr, &mut result.sql)?;
-            } else {
-                self.emit_expr(&projection.expr, &mut result.sql, false)?;
-            }
+            self.emit_expression(&projection.expr, &mut result.sql, false, aggregate)?;
             let name = if let Some(alias) = &projection.alias {
                 let alias = Ident::parse(alias)?;
                 result.sql.sql.push_str(&format!(" AS {alias}"));
@@ -838,20 +1082,27 @@ impl Scope<'_> {
         Ok(result)
     }
 
-    fn emit_aggregate(&self, expr: &Expr, query: &mut CompiledQuery) -> Result<(), CompileError> {
-        let (function, arg) = match expr {
-            Expr::Aggregate(Aggregate::CountAll) => {
+    fn emit_aggregate(
+        &self,
+        aggregate: &Aggregate,
+        query: &mut CompiledQuery,
+    ) -> Result<(), CompileError> {
+        let (function, arg) = match aggregate {
+            Aggregate::CountAll => {
                 query.sql.push_str("COUNT(*)");
                 return Ok(());
             }
-            Expr::Aggregate(Aggregate::Count(arg)) => ("COUNT", arg),
-            Expr::Aggregate(Aggregate::Sum(arg)) => ("SUM", arg),
-            _ => return Err(CompileError::ExpectedAggregate),
+            Aggregate::Count(arg) => ("COUNT", arg),
+            Aggregate::Sum(arg) => ("SUM", arg),
+            Aggregate::SumOrZero(arg) => ("COALESCE(SUM", arg),
         };
         query.sql.push_str(function);
         query.sql.push('(');
         self.emit_expr(arg, query, false)?;
         query.sql.push(')');
+        if matches!(aggregate, Aggregate::SumOrZero(_)) {
+            query.sql.push_str(", 0)");
+        }
         Ok(())
     }
 

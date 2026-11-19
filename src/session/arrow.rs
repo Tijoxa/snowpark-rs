@@ -1,12 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
-    RecordBatch, StringArray, StructArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, RecordBatch,
+    StringArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow_buffer::NullBuffer;
-use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use chrono::{DateTime, Timelike, Utc};
 use snowflake_connector_rs::{CellValue, ColumnType, DynamicRow, ResultTable};
 
@@ -38,14 +37,9 @@ pub(super) fn schema(source: &snowflake_connector_rs::Schema) -> Result<SchemaRe
                 ColumnType::TimestampLtz { .. } => {
                     DataType::Timestamp(timestamp_unit(ty), Some("UTC".into()))
                 }
-                ColumnType::TimestampTz { .. } => DataType::Struct(Fields::from(vec![
-                    Field::new(
-                        "timestamp",
-                        DataType::Timestamp(timestamp_unit(ty), Some("UTC".into())),
-                        false,
-                    ),
-                    Field::new("offset_seconds", DataType::Int32, false),
-                ])),
+                ColumnType::TimestampTz { .. } => {
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+                }
                 ColumnType::Binary { .. } => DataType::Binary,
                 _ => DataType::Utf8,
             };
@@ -176,44 +170,8 @@ fn array(rows: &[DynamicRow], index: usize, field: &Field) -> Result<ArrayRef, A
                 })?,
             )),
             DataType::Timestamp(unit, zone) => {
-                let timestamps = values(rows, index, field, |value| {
-                    let timestamp = match value {
-                        CellValue::TimestampNtz(value) => value.and_utc(),
-                        CellValue::TimestampLtz(value) => *value,
-                        _ => return None,
-                    };
-                    timestamp_value(timestamp, unit)
-                })?;
+                let timestamps = values(rows, index, field, |value| timestamp_cell(value, unit))?;
                 timestamp_array(unit, zone.clone(), timestamps)
-            }
-            DataType::Struct(fields) => {
-                let DataType::Timestamp(unit, zone) = fields[0].data_type() else {
-                    unreachable!("timestamp struct is defined by schema()");
-                };
-                let timestamps = values(rows, index, field, |value| match value {
-                    CellValue::TimestampTz(value) => Some((
-                        timestamp_value(value.to_utc(), unit)?,
-                        value.offset().local_minus_utc(),
-                    )),
-                    _ => None,
-                })?;
-                let valid: Vec<_> = timestamps.iter().map(Option::is_some).collect();
-                let instants = timestamps
-                    .iter()
-                    .map(|pair| pair.map(|(instant, _)| instant))
-                    .collect();
-                let offsets: Int32Array = timestamps
-                    .into_iter()
-                    .map(|pair| pair.map(|(_, offset)| offset))
-                    .collect();
-                Arc::new(StructArray::try_new(
-                    fields.clone(),
-                    vec![
-                        timestamp_array(unit, zone.clone(), instants),
-                        Arc::new(offsets),
-                    ],
-                    Some(NullBuffer::from(valid)),
-                )?)
             }
             DataType::Binary => {
                 let bytes = values(rows, index, field, |value| match value {
@@ -234,6 +192,16 @@ fn array(rows: &[DynamicRow], index: usize, field: &Field) -> Result<ArrayRef, A
             _ => unreachable!("Arrow data types are defined by schema()"),
         };
     Ok(array)
+}
+
+fn timestamp_cell(value: &CellValue, unit: &TimeUnit) -> Option<i64> {
+    let datetime = match value {
+        CellValue::TimestampNtz(value) => value.and_utc(),
+        CellValue::TimestampLtz(value) => *value,
+        CellValue::TimestampTz(value) => value.to_utc(),
+        _ => return None,
+    };
+    timestamp_value(datetime, unit)
 }
 
 fn timestamp_value(timestamp: DateTime<Utc>, unit: &TimeUnit) -> Option<i64> {
@@ -283,4 +251,18 @@ fn scaled_decimal(raw: &str, scale: usize) -> Option<i128> {
         .checked_mul(10_i128.pow(scale as u32))?
         .checked_add(fraction)?;
     Some(if negative { -value } else { value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_tz_preserves_the_instant_in_utc_nanoseconds() {
+        let datetime = DateTime::parse_from_rfc3339("1970-01-01T01:00:00.123456789+01:00").unwrap();
+        assert_eq!(
+            timestamp_cell(&CellValue::TimestampTz(datetime), &TimeUnit::Nanosecond),
+            Some(123_456_789)
+        );
+    }
 }

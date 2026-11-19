@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTypeError},
     prelude::*,
-    types::{PyBool, PyBytes, PyInt, PyString},
+    types::{PyBool, PyBytes, PyFloat, PyInt, PyString},
 };
 use snowpark_rs::{
     BindValue, CompiledQuery, DataType, Decimal, Session,
@@ -101,6 +101,8 @@ fn compiled_query(sql: String, binds: Vec<Bound<'_, PyAny>>) -> PyResult<Compile
                 value.extract().map(BindValue::Bool)
             } else if value.is_instance_of::<PyInt>() {
                 value.extract().map(BindValue::Int)
+            } else if value.is_instance_of::<PyFloat>() {
+                value.extract().map(BindValue::Float)
             } else if value.is_instance_of::<PyString>() {
                 value.extract().map(BindValue::Text)
             } else if value.is_none() {
@@ -115,7 +117,7 @@ fn compiled_query(sql: String, binds: Vec<Bound<'_, PyAny>>) -> PyResult<Compile
                     .map_err(|error| PyTypeError::new_err(error.to_string()))
             } else {
                 Err(PyTypeError::new_err(
-                    "expected a str, int, bool, Decimal, or None bind value",
+                    "expected a str, int, float, bool, Decimal, or None bind value",
                 ))
             }
         })

@@ -12,6 +12,6 @@ doctest = false
 [dependencies]
 arrow-ipc = "59"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-pyo3 = { version = "0.28.2", features = ["abi3-py313"] }
+pyo3 = { version = "0.29", features = ["abi3-py313"] }
 snowpark-rs = { path = "../..", features = ["session"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }

@@ -56,6 +56,51 @@ pub fn sum(column: impl Into<Column>) -> Column {
 }
 
 impl Column {
+    pub fn date_from_epoch_days(days: i64) -> Self {
+        Self(Expr::DateFromEpochDays(days))
+    }
+
+    pub fn timestamp_from_epoch(value: i64, unit: TimestampUnit, with_timezone: bool) -> Self {
+        Self(Expr::TimestampFromEpoch(value, unit, with_timezone))
+    }
+
+    pub fn temporal_epoch(self, data_type: Option<DataType>) -> Self {
+        Self(Expr::TemporalEpoch(Box::new(self.0), data_type))
+    }
+
+    pub fn utc_date(self) -> Self {
+        Self(Expr::UtcDate(Box::new(self.0)))
+    }
+
+    pub fn is_in_list(self, values: Vec<Self>, nulls_equal: bool, has_null: bool) -> Self {
+        Self(Expr::InList {
+            expr: Box::new(self.0),
+            values: values.into_iter().map(|value| value.0).collect(),
+            nulls_equal,
+            has_null,
+        })
+    }
+
+    pub fn coalesce(self, fallback: Self) -> Self {
+        Self(Expr::Coalesce(Box::new(self.0), Box::new(fallback.0)))
+    }
+
+    pub fn try_parse_json(self) -> Self {
+        Self(Expr::TryParseJson(Box::new(self.0)))
+    }
+
+    pub fn sum_or_zero(self) -> Self {
+        Self(Expr::Aggregate(Aggregate::SumOrZero(Box::new(self.0))))
+    }
+
+    pub fn eq_missing(self, other: Self) -> Self {
+        self.binary(BinaryOp::EqMissing, other)
+    }
+
+    pub fn ne_missing(self, other: Self) -> Self {
+        self.binary(BinaryOp::NeMissing, other)
+    }
+
     pub fn alias(self, name: impl Into<String>) -> Projection {
         Projection {
             expr: self.0,
@@ -248,13 +293,100 @@ pub(crate) enum Expr {
     },
     Aggregate(Aggregate),
     Literal(BindValue),
+    DateFromEpochDays(i64),
+    TimestampFromEpoch(i64, TimestampUnit, bool),
+    TemporalEpoch(Box<Self>, Option<DataType>),
+    UtcDate(Box<Self>),
+    InList {
+        expr: Box<Self>,
+        values: Vec<Self>,
+        nulls_equal: bool,
+        has_null: bool,
+    },
+    InQuery(Box<Self>, Arc<LogicalPlan>),
     Binary(Box<Self>, BinaryOp, Box<Self>),
     Cast(Box<Self>, DataType),
     Negate(Box<Self>),
     Power(Box<Self>, Box<Self>),
+    Coalesce(Box<Self>, Box<Self>),
+    TryParseJson(Box<Self>),
     Not(Box<Self>),
     IsNull(Box<Self>),
     IsNotNull(Box<Self>),
+}
+
+impl Expr {
+    pub(crate) fn contains_aggregate(&self) -> bool {
+        match self {
+            Self::Aggregate(_) => true,
+            Self::Reference { .. }
+            | Self::Literal(_)
+            | Self::DateFromEpochDays(_)
+            | Self::TimestampFromEpoch(..) => false,
+            Self::InList { expr, values, .. } => {
+                expr.contains_aggregate() || values.iter().any(Self::contains_aggregate)
+            }
+            Self::Binary(left, _, right)
+            | Self::Power(left, right)
+            | Self::Coalesce(left, right) => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            Self::Cast(inner, _)
+            | Self::TemporalEpoch(inner, _)
+            | Self::UtcDate(inner)
+            | Self::InQuery(inner, _)
+            | Self::TryParseJson(inner)
+            | Self::Negate(inner)
+            | Self::Not(inner)
+            | Self::IsNull(inner)
+            | Self::IsNotNull(inner) => inner.contains_aggregate(),
+        }
+    }
+
+    pub(crate) fn contains_ungrouped_reference(&self) -> bool {
+        match self {
+            Self::Reference { .. } => true,
+            Self::Aggregate(_)
+            | Self::Literal(_)
+            | Self::DateFromEpochDays(_)
+            | Self::TimestampFromEpoch(..) => false,
+            Self::InList { expr, values, .. } => {
+                expr.contains_ungrouped_reference()
+                    || values.iter().any(Self::contains_ungrouped_reference)
+            }
+            Self::Binary(left, _, right)
+            | Self::Power(left, right)
+            | Self::Coalesce(left, right) => {
+                left.contains_ungrouped_reference() || right.contains_ungrouped_reference()
+            }
+            Self::Cast(inner, _)
+            | Self::TemporalEpoch(inner, _)
+            | Self::UtcDate(inner)
+            | Self::InQuery(inner, _)
+            | Self::TryParseJson(inner)
+            | Self::Negate(inner)
+            | Self::Not(inner)
+            | Self::IsNull(inner)
+            | Self::IsNotNull(inner) => inner.contains_ungrouped_reference(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum TimestampUnit {
+    Milliseconds,
+    Microseconds,
+    Nanoseconds,
+}
+
+impl TimestampUnit {
+    pub(crate) fn scale(self) -> u8 {
+        match self {
+            Self::Milliseconds => 3,
+            Self::Microseconds => 6,
+            Self::Nanoseconds => 9,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -262,12 +394,15 @@ pub(crate) enum Aggregate {
     CountAll,
     Count(Box<Expr>),
     Sum(Box<Expr>),
+    SumOrZero(Box<Expr>),
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum BinaryOp {
     Eq,
     Ne,
+    EqMissing,
+    NeMissing,
     Lt,
     Le,
     Gt,
@@ -286,6 +421,8 @@ impl BinaryOp {
         match self {
             Self::Eq => " = ",
             Self::Ne => " <> ",
+            Self::EqMissing => " IS NOT DISTINCT FROM ",
+            Self::NeMissing => " IS DISTINCT FROM ",
             Self::Lt => " < ",
             Self::Le => " <= ",
             Self::Gt => " > ",

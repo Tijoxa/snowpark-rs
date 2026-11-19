@@ -3,10 +3,11 @@ use std::fmt;
 use crate::{DataType, Decimal};
 
 /// A value bound to a Snowflake SQL placeholder.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BindValue {
     Text(String),
     Int(i64),
+    Float(f64),
     Bool(bool),
     Null(DataType),
     Decimal(Decimal),
@@ -49,7 +50,7 @@ impl From<bool> for BindValue {
 }
 
 /// Snowflake SQL and its parameters in textual placeholder order.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct CompiledQuery {
     pub sql: String,
     pub binds: Vec<BindValue>,

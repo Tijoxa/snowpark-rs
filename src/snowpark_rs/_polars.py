@@ -3,31 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from importlib import import_module
 from typing import TYPE_CHECKING, cast
 
-if TYPE_CHECKING:
-    from ._core import DataFrame
-    from ._session import Session
+import polars as pl
 
-    try:
-        from polars import DataFrame as PolarsDataFrame
-    except ImportError:
-        from typing import Any as PolarsDataFrame
+if TYPE_CHECKING:
+    from ._frame import DataFrame
+    from ._session import Session
 
 
 def to_polars(
     dataframe: DataFrame, session: Session, use_batches: bool
-) -> PolarsDataFrame | Iterator[PolarsDataFrame]:
-    try:
-        pl = import_module("polars")
-    except ModuleNotFoundError as error:
-        if error.name != "polars":
-            raise
-        raise ImportError(
-            'Install "snowpark-rs[session,polars]" to use to_polars()'
-        ) from error
-
+) -> pl.DataFrame | Iterator[pl.DataFrame]:
     if use_batches:
-        return map(pl.from_arrow, dataframe.to_arrow_batches(session))
-    return cast("PolarsDataFrame", pl.from_arrow(dataframe.to_arrow(session)))
+        return (
+            cast("pl.DataFrame", pl.from_arrow(table))
+            for table in dataframe.to_arrow_batches(session)
+        )
+    return cast("pl.DataFrame", pl.from_arrow(dataframe.to_arrow(session)))

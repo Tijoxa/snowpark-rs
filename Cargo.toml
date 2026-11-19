@@ -12,10 +12,10 @@ default-members = [".", "crates/snowflake-ast"]
 resolver = "3"
 
 [features]
-python = ["dep:pyo3"]
+polars = ["dep:polars-core", "dep:polars-plan", "dep:chrono"]
+python = ["polars", "dep:polars-python", "dep:pyo3", "dep:pyo3-polars"]
 session = [
     "dep:arrow-array",
-    "dep:arrow-buffer",
     "dep:arrow-schema",
     "dep:arrow-select",
     "dep:async-stream",
@@ -30,14 +30,19 @@ session = [
 
 [dependencies]
 arrow-array = { version = "59", optional = true }
-arrow-buffer = { version = "59", optional = true }
 arrow-schema = { version = "59", optional = true }
 arrow-select = { version = "59", optional = true }
 async-stream = { version = "0.3", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false }
 dirs = { version = "6", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
-pyo3 = { version = "0.28.2", optional = true, features = ["abi3-py313"] }
+# PyExpr uses bincode, whose variant indices depend on the exact Polars source
+# and DSL features. Match the py-2.1.0 runtime's 32-bit expression layout.
+polars-core = { git = "https://github.com/pola-rs/polars.git", rev = "7f902bd3ffd27ff82d14278a09a295ff2f7aed92", optional = true, default-features = false }
+polars-plan = { git = "https://github.com/pola-rs/polars.git", rev = "7f902bd3ffd27ff82d14278a09a295ff2f7aed92", optional = true, default-features = false, features = ["dtype-date", "dtype-datetime", "dtype-decimal", "dtype-duration", "ffi_plugin", "is_in", "regex", "timezones"] }
+polars-python = { git = "https://github.com/pola-rs/polars.git", rev = "7f902bd3ffd27ff82d14278a09a295ff2f7aed92", optional = true, default-features = false, features = ["catalog", "full_functionality", "iejoin", "rt32", "trigonometry"] }
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py313"] }
+pyo3-polars = { git = "https://github.com/pola-rs/polars.git", rev = "7f902bd3ffd27ff82d14278a09a295ff2f7aed92", optional = true, features = ["lazy"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 snowflake-ast = { path = "crates/snowflake-ast" }
 snowflake-connector-rs = { version = "1.1.1", optional = true }
@@ -46,6 +51,10 @@ toml = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "time"] }
+
+[patch.crates-io]
+# The pinned Polars runtime uses the hash-table prefetch API from this revision.
+hashbrown = { git = "https://github.com/pola-rs/hashbrown", rev = "d76a6f81abd8f388676aff15068236a8d21c7e1a" }
 
 [[test]]
 name = "snowflake_smoke"

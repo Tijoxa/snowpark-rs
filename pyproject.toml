@@ -7,11 +7,10 @@ authors = [
     { name = "Tijoxa", email = "92037181+Tijoxa@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = ["polars==2.1.0"]
 
 [project.optional-dependencies]
 session = ["pyarrow", "snowpark-rs-session==0.1.0", "tzdata"]
-polars = ["polars>=1"]
 
 [dependency-groups]
 dev = ["pytest", "snowflake-snowpark-python>=1.57.0"]
@@ -25,10 +24,6 @@ python-source = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[tool.ty.analysis]
-# Polars is an optional extra. Use its type information when it is installed.
-allowed-unresolved-imports = ["polars"]
 
 [tool.uv]
 cache-keys = [

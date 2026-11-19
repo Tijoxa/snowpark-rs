@@ -14,6 +14,10 @@
 //! Enable the `session` feature to execute a frame and return Arrow results.
 
 mod dataframe;
+#[cfg(feature = "polars")]
+pub mod polars;
+#[cfg(feature = "python")]
+mod polars_plugin;
 #[cfg(feature = "python")]
 mod python;
 #[cfg(feature = "session")]

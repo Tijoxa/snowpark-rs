@@ -9,7 +9,7 @@ use crate::session::{self, ArrowBatches, ExecuteError, RecordBatch, Session};
 #[derive(Clone)]
 #[must_use]
 pub struct DataFrame {
-    plan: snowflake_ast::DataFrame,
+    pub(crate) plan: snowflake_ast::DataFrame,
 }
 
 impl DataFrame {
@@ -137,8 +137,19 @@ impl DataFrame {
     }
 
     /// Reference a column exported by this frame in a join condition.
+    pub fn select_scalar(&self, projections: Vec<Projection>) -> Self {
+        Self {
+            plan: self.plan.select_scalar(projections),
+        }
+    }
+
     pub fn col(&self, name: impl Into<String>) -> Column {
         self.plan.col(name)
+    }
+
+    /// Test membership in the output of a single-column query.
+    pub fn membership(&self, value: Column) -> Column {
+        self.plan.membership(value)
     }
 
     /// Group rows by the supplied keys before aggregating.

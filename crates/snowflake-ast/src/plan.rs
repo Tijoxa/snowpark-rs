@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use crate::{Field, Projection, SortKey, expr::Expr, ident::ObjectName};
+use crate::{CompileError, Field, Projection, SortKey, expr::Expr, ident::ObjectName};
+
+type LowerPlan = dyn Fn() -> Result<Arc<LogicalPlan>, CompileError> + Send + Sync;
 
 /// How a join handles rows that do not satisfy its condition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +31,10 @@ pub(crate) enum UnionAlignment {
 }
 
 pub(crate) enum LogicalPlan {
+    Deferred {
+        lower: Box<LowerPlan>,
+        resolved: OnceLock<Result<Arc<Self>, CompileError>>,
+    },
     Scan {
         table: ObjectName,
         schema: Option<Vec<Field>>,
@@ -38,6 +44,10 @@ pub(crate) enum LogicalPlan {
         predicate: Expr,
     },
     Project {
+        input: Arc<Self>,
+        projections: Vec<Projection>,
+    },
+    ScalarProject {
         input: Arc<Self>,
         projections: Vec<Projection>,
     },

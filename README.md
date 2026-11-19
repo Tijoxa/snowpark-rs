@@ -6,82 +6,123 @@ The optional `session` feature uses `snowflake-connector-rs` to execute them.
 
 ## Python
 
-Install the project and its Snowpark Python development dependency with Python
-3.13 or 3.14 and Rust 1.94 or newer.
+Install with Python 3.13 or 3.14 and Rust 1.95 or newer.
 
 ```sh
 uv sync --dev
 ```
 
 ```python
-from snowpark_rs import Table, functions as F
+import polars as pl
+import snowpark_rs as pls
 
-frame = Table("PUBLIC.PUBLIC.EXAMPLE")
-sql, binds = frame.filter(F.col("NAME") == "Alice").to_sql()
-assert (sql, binds) == frame.filter(F.col("NAME").eq("Alice")).to_sql()
+query = (
+    pls.Table("PUBLIC.PUBLIC.SALES")
+    .filter(pl.col("AMOUNT") > 100, REGION="EU")
+    .select("REGION", DOUBLE_AMOUNT=pl.col("AMOUNT") * 2)
+)
+sql, binds = query.to_sql()
+assert binds == [2, 100, "EU"]
 ```
 
-The Python API compiles queries offline and returns single-line SQL with ordered
-bind values. In this example, the SQL contains `WHERE t0."NAME" = ?` and
-`binds` is `["Alice"]`. `frame.pipe(function, *args, **kwargs)` passes the frame
-as the function's first argument and returns its result. Run the tests with
-`uv run pytest`.
+`Table` builds a lazy Snowflake query. `select`, `filter`, `with_columns`,
+`group_by().agg()` and `sort` take Polars expressions. Pass a column name as
+a string or use `pl.lit("value")` for a string value in a projection. Both
+`to_sql()` and the execution methods translate the expressions before
+sending any SQL. An unsupported expression raises
+`snowpark_rs.UnsupportedPolarsExpression` with the operation and reason.
 
 ### Group, sort, and join
 
 ```python
-from snowpark_rs import Table
-from snowpark_rs.functions import col, count, sum
-
-source = Table("PUBLIC.PUBLIC.EXAMPLE")
+source = pls.Table("PUBLIC.PUBLIC.SALES")
 totals = (
-    source.group_by("category")
-    .agg(count("*").alias("rows"), sum("amount").alias("total"))
-    .sort(col("total").desc_nulls_last())
+    source.group_by("CATEGORY")
+    .agg(rows=pl.len(), total=pl.col("AMOUNT").sum())
+    .sort("total", descending=True, nulls_last=True)
     .limit(10)
 )
 
-left = source.select(["id", "name"])
-right = source.select(["id", "amount"])
-joined = left.join(right, left["id"].eq(right["id"]), how="left", rsuffix="_right")
+left = source.select("ID", "NAME")
+right = source.select("ID", "AMOUNT")
+joined = left.join(right, on="ID", how="left")
 ```
 
-Use `agg(...)` directly on a DataFrame for a global aggregate. A sort can end a
-query or precede a limit. Inner, left, right, and full joins take inputs with named
-outputs. By default, overlapping names receive deterministic `L_` and `R_`
-prefixes. Pass `lsuffix` or `rsuffix` to choose the output names.
+The compiler supports column references, scalar literals, aliases, comparisons,
+null tests, Boolean logic, numeric arithmetic, a subset of strict casts,
+`sum()`, `count()` and `pl.len()`. `sum()` returns zero for an empty or
+all-null input. Polars-style null placement is explicit in `ORDER BY`.
+True division requires a nonzero literal divisor. Windows, list reductions,
+and broadcasting aggregates over source rows produce an error.
+A sort can end a query or precede a limit.
 
-### Schemas, expressions, and set operations
+### Dates, datetimes, and membership
 
 ```python
-from decimal import Decimal
+from datetime import date
 
-from snowpark_rs import Field, Table
-from snowpark_rs.functions import lit, lit_null
+source = pls.Table("PUBLIC.PUBLIC.EXAMPLE")
+query = source.filter(pl.col("CREATED_AT") >= pl.date(2024, 1, 1))
+same = source.filter(pl.col("CREATED_AT") >= date(2024, 1, 1))
 
-items = Table("ITEMS", schema=[Field("id", "int"), Field("amount", "number(10,2)")])
-current = (
-    items.with_column("total", (items["amount"] * Decimal("1.20")).cast("number(12,2)"))
-    .rename("id", "item_id")
-    .distinct()
-)
-archived = Table("ARCHIVED_ITEMS").select(["item_id", lit_null("number(12,2)").alias("total")])
-combined = current.select(["item_id", "total"]).union_all_by_name(archived)
-print(combined.columns)
+ids = source.filter(pl.col("CATEGORY") == "A").select("ID")
+matching = source.filter(pl.col("ID").is_in(ids))
+matching_imploded = source.filter(pl.col("ID").is_in(ids.implode()))
 ```
 
-`schema` describes the fields known to the local plan and `columns` gives their
-Snowflake identifiers in order. They return `None` when the output names cannot
-be determined offline. Supply a complete ordered schema at the table or select
-named columns first when using `with_column` or strict name-based unions.
-`schema_with_session(session)` returns the Arrow schema from a zero-row Snowflake
-query, including types and nullability as reported by Snowflake.
+The temporal comparisons also accept `datetime.datetime`. Date-to-datetime
+comparisons use midnight, in UTC for timestamps with a time zone. Declare
+the source schema to check the compatibility of comparisons between columns
+offline. Constant `pl.date` and `pl.datetime` constructors are supported.
 
-`lit(Decimal(...))` keeps fixed-point precision, and `lit_null("number(12,2)")`
-or `lit(None, datatype="number(12,2)")` creates a typed SQL null. Python
-`to_sql()` exposes those bind values as `Decimal` and `None`.
+`is_in` accepts a literal list, an imploded Polars Series, or a Snowflake query
+with exactly one column. Snowflake query operands are supported in positive
+filters, including conjunctions. A multi-column query raises an error during
+compilation when its schema is known, or during Snowflake execution otherwise.
+
+### Schemas, selectors, and replacements
+
+```python
+items = pls.Table("ITEMS", schema=[
+    pls.Field("ID", "number(10,0)"),
+    pls.Field("AMOUNT", "number(12,2)"),
+])
+current = (
+    items.with_columns(total=pl.col("AMOUNT") * 2)
+    .rename({"ID": "item_id"})
+    .unique()
+)
+print(current.columns)
+```
+
+Column names and aliases use exact case. For a table created with unquoted
+Snowflake identifiers, use names such as `pl.col("AMOUNT")`. If an input
+schema is declared, use SQL identifiers for the `Field` constructors
+(`Field('"mixedCase"')` for a quoted name). `schema` and `columns` describe
+the outputs known to the local compiler. Supply a complete schema or select
+named columns first for `with_columns`, name-based selectors that require the
+schema, and joins. Dtype selectors also need the corresponding field types.
+
 `union` and `union_all` match columns by position. The `_by_name` variants
-match names and accept `allow_missing_columns=True`.
+match names and accept `allow_missing_columns=True`. `pipe` forwards the
+query to a Python callable.
+
+### Snowflake expressions
+
+```python
+payloads = pls.Table("PAYLOADS")
+query = payloads.select(
+    parsed=pls.col("PAYLOAD").snowflake.try_parse_json(),
+    invalid=pls.try_parse_json("PAYLOAD").is_null(),
+)
+```
+
+Both forms produce a genuine `pl.Expr`. The native plugin reports a Polars
+`ComputeError` if evaluated locally. A Snowflake query compiles it to
+`TRY_PARSE_JSON`, which returns a `VARIANT` or SQL `NULL` for invalid JSON.
+The package pins Polars 2.1.0 and uses that release's 32-bit runtime.
+`pyo3-polars` imports expressions at compilation time for the shared Rust
+translator. The expression format and plugin ABI are tied to that release.
 
 ### Execute with a Snowflake session
 
@@ -103,13 +144,17 @@ programmatic access token, OAuth token and PKCS#8 key-pair profiles. Each
 Arrow call starts a separate query with the supplied session.
 `to_arrow()` returns a `pyarrow.Table`, while `to_arrow_batches()` reads
 partitions incrementally as tables. Exact `NUMBER` values use Arrow decimal
-columns. `TIMESTAMP_TZ` values carry a UTC timestamp and the original offset
-in seconds. Semi-structured values are represented as JSON text.
+columns. `TIMESTAMP_TZ` is exported as Arrow `timestamp[ns, tz=UTC]` and
+Polars `datetime[ns, UTC]`. `TIMESTAMP_LTZ` is also exported in UTC.
+`TIMESTAMP_NTZ` remains timezone-naive. The Arrow units of `LTZ` and `NTZ`
+follow their Snowflake precision, with nanoseconds at the default precision.
+Semi-structured values are represented as JSON text.
 
 ### Convert results to Polars
 
-Install `snowpark-rs[session,polars]` to convert Arrow results to Polars. In this
-checkout, run `uv sync --dev --extra session --extra polars`.
+The `session` extra enables `to_polars` through Arrow. The result uses
+Snowflake's Arrow types, including decimal columns for Snowflake `NUMBER`
+and JSON text for `VARIANT`.
 
 ```python
 data = query.to_polars(session)
@@ -117,10 +162,29 @@ for batch in query.to_polars(session, use_batches=True):
     print(batch.height)
 ```
 
+## Polars expressions in Rust
+
+Enable the optional Cargo feature `polars` and import the expression
+constructors from `snowpark_rs::polars`. The query retains the typed expressions
+until SQL compilation, schema resolution, or execution.
+
+```rust
+use snowpark_rs::{DataFrame, polars::{col, lit}};
+
+let query = DataFrame::table_name("DB.PUBLIC.SALES")?
+    .filter_polars(col("AMOUNT").gt(lit(100)))
+    .select_polars([(col("AMOUNT") * lit(2)).alias("double")]);
+let compiled = query.to_sql()?;
+```
+
+`with_columns_polars`, `group_by_polars().agg()`, `agg_polars` and
+`sort_polars` also accept typed expressions. Polars column names preserve case.
+
 ## Rust tests
 
 ```sh
 cargo test --locked --no-default-features
+cargo test --locked -p snowpark-rs --features polars
 cargo test --locked -p snowpark-rs --features session
 ```
 
@@ -130,4 +194,13 @@ profile and the `PUBLIC.PUBLIC.EXAMPLE` fixture.
 
 ```sh
 cargo test --locked -p snowpark-rs --features session --test snowflake_smoke -- --ignored
+```
+
+The Python parity test uses a Snowflake test profile named by
+`SNOWPARK_RS_TEST_CONNECTION`. It reads `PUBLIC.PUBLIC.EXAMPLE` by default.
+Set `SNOWPARK_RS_TEST_TABLE` to use another fixture with `CATEGORY` and
+`AMOUNT` columns.
+
+```sh
+uv run --locked --extra session pytest tests/test_polars_snowflake.py
 ```

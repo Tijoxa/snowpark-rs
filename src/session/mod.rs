@@ -74,6 +74,7 @@ pub async fn execute_arrow_batches(
         statement = match value {
             BindValue::Text(value) => statement.bind(value),
             BindValue::Int(value) => statement.bind(value),
+            BindValue::Float(value) => statement.bind(value),
             BindValue::Bool(value) => statement.bind(value),
             // The compiler casts these binds to the target Snowflake type.
             BindValue::Decimal(value) => statement.bind(value.to_string()),
