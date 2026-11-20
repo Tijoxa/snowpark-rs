@@ -22,6 +22,30 @@ fn snowflake_connection() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+#[ignore = "requires a named Snowflake profile with permission to create a temporary table in PUBLIC.PUBLIC"]
+fn snowflake_dataframe_uses_the_explicit_session() -> Result<(), Box<dyn Error>> {
+    with_session(async |first| {
+        let second = connect_profile(None).await?;
+        let frame = DataFrame::table_name("SNOWPARK_RS_SESSION_FIXTURE")?.select(["id"]);
+
+        for (session, id) in [(&first, 1), (&second, 2)] {
+            session.query("USE SCHEMA PUBLIC.PUBLIC").await?;
+            session
+                .query(format!(
+                    "CREATE TEMPORARY TABLE SNOWPARK_RS_SESSION_FIXTURE AS SELECT {id} AS ID"
+                ))
+                .await?;
+        }
+
+        for (session, id) in [(&first, 1), (&second, 2)] {
+            let rows = frame.to_arrow(session).await?;
+            assert_eq!(decimals(&rows, 0).iter().collect::<Vec<_>>(), [Some(id)]);
+        }
+        Ok(())
+    })
+}
+
+#[test]
 #[ignore = "requires a named Snowflake profile and the PUBLIC.PUBLIC.EXAMPLE fixture"]
 fn snowflake_dataframe() -> Result<(), Box<dyn Error>> {
     with_session(async |session| {
