@@ -15,7 +15,7 @@ Le moteur couvre déjà les projections, les filtres, l’agrégation, le tri, l
 - [x] **Ajouter les types, les schémas et les expressions de base.** Exposer `schema` et `columns`, les `NULL` typés, les décimaux exacts, `cast` et l’arithmétique. [Tests Rust](crates/snowflake-ast/tests/types_and_sets.rs) · [Tests Python](tests/test_dataframe.py)
 - [x] **Étendre les transformations relationnelles.** Ajouter `with_column`, `rename`, `distinct`, les jointures externes et les unions par position ou par nom. [Tests Rust](crates/snowflake-ast/tests/types_and_sets.rs) · [Tests Python](tests/test_dataframe.py)
 - [ ] **Élargir le vocabulaire SQL Snowflake selon les besoins de traduction.** Prioriser la résolution des projections et les constructions SQL nécessaires aux premières expressions Polars ou extensions Snowflake. [Pistes SQL Snowflake](#9-vocabulaire-sql-snowflake)
-- [ ] **Prototyper le cache Parquet partitionné.** Valider les colonnes de `partition_by` dans le schéma, appliquer le TTL configuré sur la session et stocker les partitions sous `cache_dir / "db.schema.table"`. Prévoir la lecture locale avec DataFusion. [Plan du cache](plan_caching.md)
+- [ ] **Prototyper le cache Parquet partitionné.** Configurer `cache_dir` et `ttl` via `Session.builder`, puis activer le cache avec `to_arrow(session, partition_by=[...])` ou `to_polars(session, partition_by=[...])` sur un plan construit avec `Table` et des expressions Polars. Valider les colonnes de partitionnement, stocker les partitions sous `cache_dir / "db.schema.table"` et prévoir la lecture locale avec DataFusion. [Plan du cache](plan_caching.md)
 
 ## Architecture du MVP
 
@@ -121,23 +121,36 @@ Dans `snowflake-ast`, une branche dérivée partage le plan parent et construit 
 
 ## Validation avec PUBLIC.PUBLIC.EXAMPLE
 
-Le test d’intégration actuel lit cette table avec ses cinq lignes. Pour la préparer dans un environnement de test vide, créer la table puis insérer les lignes suivantes. Les autres jeux de données du plan utilisent des objets temporaires propres aux tests.
+Les tests d’intégration Rust et Python lisent cette table avec ses cinq lignes. Pour la préparer dans un environnement de test vide, créer la table puis insérer les lignes suivantes. Conserver `CREATED_AT` de type `DATE` et ajouter les trois variantes de timestamp à la précision nanoseconde utilisées par les tests Python. Les timestamps de cette fixture couvrent volontairement des instants de part et d’autre du 1er janvier 2024, des fractions de seconde et plusieurs décalages UTC, indépendamment des dates historiques de `CREATED_AT`. Les autres jeux de données du plan utilisent des objets temporaires propres aux tests.
 
 ```sql
 CREATE TABLE PUBLIC.PUBLIC.EXAMPLE (
-    id          INT,
-    name        STRING,
-    category    STRING,
-    amount      NUMBER(10,2),
-    created_at  DATE
+    id              INT,
+    name            STRING,
+    category        STRING,
+    amount          NUMBER(10,2),
+    created_at      DATE,
+    created_at_tz   TIMESTAMP_TZ(9),
+    created_at_ltz  TIMESTAMP_LTZ(9),
+    created_at_ntz  TIMESTAMP_NTZ(9)
 );
 
-INSERT INTO PUBLIC.PUBLIC.EXAMPLE VALUES
-    (1, 'Alice',   'A', 120.50, '2026-01-15'),
-    (2, 'Bob',     'B',  89.99, '2026-02-03'),
-    (3, 'Charlie', 'A', 240.00, '2026-03-21'),
-    (4, 'Diana',   'C',  15.75, '2026-04-10'),
-    (5, 'Ethan',   'B', 310.20, '2026-05-28');
+INSERT INTO PUBLIC.PUBLIC.EXAMPLE (
+    id, name, category, amount, created_at,
+    created_at_tz, created_at_ltz, created_at_ntz
+)
+SELECT
+    id, name, category, amount, TO_DATE(created_at, 'YYYY-MM-DD'),
+    TO_TIMESTAMP_TZ(ts || ' ' || tz, 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'),
+    TO_TIMESTAMP_TZ(ts || ' ' || tz, 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM')::TIMESTAMP_LTZ(9),
+    TO_TIMESTAMP_NTZ(ts, 'YYYY-MM-DD HH24:MI:SS.FF9')
+FROM VALUES
+    (1, 'Alice',   'A', 120.50, '2026-01-15', '2023-12-31 23:59:59.999999999', '+00:00'),
+    (2, 'Bob',     'B',  89.99, '2026-02-03', '2024-01-01 00:00:00.123456000', '+00:00'),
+    (3, 'Charlie', 'A', 240.00, '2026-03-21', '2024-01-01 01:00:00.123456001', '+01:00'),
+    (4, 'Diana',   'C',  15.75, '2026-04-10', '2026-04-10 09:15:00.000000000', '-04:00'),
+    (5, 'Ethan',   'B', 310.20, '2026-05-28', '2026-05-28 18:45:00.000000000', '+02:00')
+AS fixture(id, name, category, amount, created_at, ts, tz);
 ```
 
 Le premier cas construit le plan `Project([id, name], Filter(category = lit("A"), Scan(PUBLIC.PUBLIC.EXAMPLE)))`. Le test hors ligne vérifie le SQL et le paramètre suivants.
@@ -151,6 +164,8 @@ WHERE t0."CATEGORY" = ?
 Le seul paramètre est `BindValue::Text("A")`. Le test d’intégration vérifie les colonnes `ID` et `NAME` ainsi que les deux lignes `(1, "Alice")` et `(3, "Charlie")`, indépendamment de leur ordre.
 
 Pour le jalon agrégation, réutiliser la table avec `group_by(category).agg(sum(amount).alias("total")).sort(category.asc())`. Vérifier les totaux décimaux exacts `A = 360.50`, `B = 400.19` et `C = 15.75`, dans cet ordre.
+
+Le test [de parité temporelle Python](tests/test_polars_snowflake.py) compare les filtres `>= pl.date(2024, 1, 1)` sur les quatre colonnes temporelles et `<= datetime(..., tzinfo=UTC)` sur `CREATED_AT_TZ` avec les mêmes opérations exécutées localement dans Polars. Il vérifie également les types Polars `Datetime("ns", "UTC")` pour les timestamps `TZ` et `LTZ`, et `Datetime("ns")` pour `NTZ`, ainsi que le type Arrow `timestamp[ns, tz=UTC]` de `CREATED_AT_TZ`. La fixture sert aussi à vérifier `is_in` avec une sous-requête mono-colonne et le rejet d’une sous-requête multi-colonnes.
 
 ## Session explicite et exécution Arrow
 
@@ -246,7 +261,7 @@ Les jalons suivants recensent les capacités déjà implémentées et les pistes
 
 ### 6. Écritures, fichiers et durée de vie des objets
 
-- [ ] **Cache Parquet local.** Stocker le cache de chaque table dans `cache_dir / "db.schema.table"`. Le nom pleinement qualifié forme un seul répertoire sous le `cache_dir` configuré sur la session. Écrire les fichiers Parquet et leurs éventuels sous-répertoires de partition sous ce répertoire.
+- [ ] **Cache Parquet local.** Stocker le cache de chaque table dans `cache_dir / "db.schema.table"`. Le nom pleinement qualifié forme un seul répertoire sous le `cache_dir` configuré via `Session.builder`. Dans ce répertoire, isoler les résultats selon leur plan, leurs paramètres et leur contexte Snowflake, puis écrire les fichiers Parquet dans les sous-répertoires de partition. [Plan du cache](plan_caching.md)
 - [ ] **Tables, vues et matérialisation.** Ajouter `save_as_table`, `insert_into`, modes d’écriture, alignement des colonnes par nom ou position, vues temporaires/permanentes et `cache_result`. Ajouter ensuite tables dynamiques et variantes de stockage suivant le besoin. Tester chaque mode initial/sur table existante, ordre des colonnes, visibilité par session, binds acceptés en création et comportement explicite quand Snowflake les refuse, réutilisation du cache, nettoyage après succès/échec et protection des objets permanents. [Écritures](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/scala/test_dataframe_writer_suite.py) · [Vues](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/scala/test_view_suite.py) · [Objets temporaires](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/test_temp_table_cleanup.py)
 - [ ] **Mutations.** Ajouter des actions explicites pour `update`, `delete`, `merge`, `drop_table` et leurs résultats typés. Tester filtres, sources jointes et clés ambiguës, clauses `WHEN MATCHED`/`WHEN NOT MATCHED`, ordre des clauses, nombre de lignes modifiées, annulation par rollback quand applicable et absence de rejeu implicite en cas d’issue incertaine. [API Table](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/docs/source/snowpark/table.rst) · [Tests DML](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/scala/test_update_delete_merge_suite.py)
 - [ ] **Lecteurs et `COPY`.** Couvrir CSV, JSON, Parquet, Avro, ORC et XML à partir d’un stage avec options, schéma explicite/inféré et colonnes de métadonnées. Ajouter `COPY INTO` table/emplacement, filtres de fichiers, validation et exports CSV/JSON/Parquet. Tester fichiers multiples, motifs sans correspondance, cas des noms, encodages et options, données malformées, transformations, compteurs et comportement transactionnel. [API I/O](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/docs/source/snowpark/io.rst) · [Reader](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/scala/test_dataframe_reader_suite.py) · [COPY](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/scala/test_dataframe_copy_into.py) · [XML](https://github.com/snowflakedb/snowpark-python/blob/781939e92343ee4280885eb879c9eaf3ab13e59e/tests/integ/test_xml_infer_schema.py)
