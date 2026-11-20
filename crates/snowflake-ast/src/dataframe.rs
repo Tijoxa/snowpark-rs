@@ -4,7 +4,7 @@ use crate::{
     Column, CompileError, CompiledQuery, Field, JoinType, Projection, SortKey, compile,
     expr::Expr,
     ident::ObjectName,
-    plan::{LogicalPlan, UnionAlignment},
+    plan::{LogicalPlan, PredicateClause, UnionAlignment},
 };
 
 /// An immutable Snowflake query that can be compiled offline.
@@ -78,6 +78,12 @@ impl DataFrame {
     /// Returns `None` when the plan cannot determine all output names.
     pub fn schema(&self) -> Result<Option<Vec<Field>>, CompileError> {
         compile::schema(&self.plan)
+    }
+
+    /// Source fields visible in a HAVING or QUALIFY predicate.
+    #[doc(hidden)]
+    pub fn clause_input_schema(&self) -> Result<Option<Vec<Field>>, CompileError> {
+        compile::clause_input_schema(&self.plan)
     }
 
     /// Return the ordered Snowflake identifiers known offline.
@@ -188,10 +194,25 @@ impl DataFrame {
 
     /// Keep rows for which the predicate evaluates to true.
     pub fn filter(&self, predicate: Column) -> Self {
+        self.filter_in(predicate, PredicateClause::Where)
+    }
+
+    /// Filter the current aggregation with HAVING. Group keys and aliases are visible.
+    pub fn having(&self, predicate: Column) -> Self {
+        self.filter_in(predicate, PredicateClause::Having)
+    }
+
+    /// Filter window results with QUALIFY. The projection or predicate must contain a window.
+    pub fn qualify(&self, predicate: Column) -> Self {
+        self.filter_in(predicate, PredicateClause::Qualify)
+    }
+
+    fn filter_in(&self, predicate: Column, clause: PredicateClause) -> Self {
         Self {
             plan: Arc::new(LogicalPlan::Filter {
                 input: Arc::clone(&self.plan),
                 predicate: predicate.0,
+                clause,
             }),
         }
     }
@@ -258,6 +279,24 @@ impl DataFrame {
     /// Return at most `count` rows.
     pub fn limit(&self, count: u64) -> Self {
         self.limit_with_offset(count, 0)
+    }
+
+    /// Return the first `count` rows. Use a sort to make the selection deterministic.
+    pub fn head(&self, count: u64) -> Self {
+        self.limit(count)
+    }
+
+    /// Return the last `count` rows in the current explicit sort order.
+    pub fn tail(&self, count: u64) -> Self {
+        if count == 0 {
+            return self.head(0);
+        }
+        Self {
+            plan: Arc::new(LogicalPlan::Tail {
+                input: Arc::clone(&self.plan),
+                count,
+            }),
+        }
     }
 
     /// Skip `offset` rows, then return at most `count` rows.

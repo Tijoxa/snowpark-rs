@@ -30,6 +30,13 @@ pub(crate) enum UnionAlignment {
     Name { allow_missing_columns: bool },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PredicateClause {
+    Where,
+    Having,
+    Qualify,
+}
+
 pub(crate) enum LogicalPlan {
     Deferred {
         lower: Box<LowerPlan>,
@@ -42,6 +49,7 @@ pub(crate) enum LogicalPlan {
     Filter {
         input: Arc<Self>,
         predicate: Expr,
+        clause: PredicateClause,
     },
     Project {
         input: Arc<Self>,
@@ -64,6 +72,10 @@ pub(crate) enum LogicalPlan {
         input: Arc<Self>,
         count: u64,
         offset: u64,
+    },
+    Tail {
+        input: Arc<Self>,
+        count: u64,
     },
     Join {
         left: Arc<Self>,

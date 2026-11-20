@@ -1,8 +1,8 @@
 from datetime import UTC, date, datetime
 
-import polars as pl
 import pytest
 
+import polars as pl
 from snowpark_rs import Field, Table, UnsupportedPolarsExpression
 
 CUTOFF = date(2024, 1, 1)

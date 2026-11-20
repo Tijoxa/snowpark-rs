@@ -101,8 +101,16 @@ impl PyDataFrame {
         exprs: Vec<Bound<'_, PyAny>>,
         plugin_path: &str,
         membership: &Bound<'_, PyAny>,
+        clause: &str,
     ) -> PyResult<Self> {
-        let exprs = extract_exprs(exprs, "filter")?;
+        let clause = match clause {
+            "filter" => polars::PredicateClause::Filter,
+            "having" => polars::PredicateClause::Having,
+            "qualify" => polars::PredicateClause::Qualify,
+            _ => return Err(PyValueError::new_err("unknown predicate clause")),
+        };
+        let operation = clause.operation();
+        let exprs = extract_exprs(exprs, operation)?;
         let callback_error = RefCell::new(None);
         let lookup = |token: &str| {
             membership
@@ -114,7 +122,7 @@ impl PyDataFrame {
                 .map_err(|error| {
                     *callback_error.borrow_mut() = Some(error);
                     polars::unsupported(
-                        "filter",
+                        operation,
                         "IsIn",
                         "the membership query could not be resolved",
                     )
@@ -124,7 +132,7 @@ impl PyDataFrame {
             plugin_path: Some(Path::new(plugin_path)),
             membership: Some(&lookup),
         };
-        let result = polars::filter(&self.0.plan, &exprs, &context);
+        let result = polars::filter(&self.0.plan, &exprs, &context, clause);
         if let Some(error) = callback_error.into_inner() {
             return Err(error);
         }
@@ -206,6 +214,10 @@ impl PyDataFrame {
 
     fn limit(&self, n: u64, offset: u64) -> Self {
         Self(self.0.limit_with_offset(n, offset))
+    }
+
+    fn tail(&self, n: u64) -> Self {
+        Self(self.0.tail(n))
     }
 
     fn rename(&self, names: Vec<(String, String)>) -> Self {

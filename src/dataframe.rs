@@ -129,6 +129,20 @@ impl DataFrame {
         }
     }
 
+    /// Filter groups with HAVING, with access to aggregation aliases.
+    pub fn having(&self, predicate: Column) -> Self {
+        Self {
+            plan: self.plan.having(predicate),
+        }
+    }
+
+    /// Filter window results with QUALIFY, with access to projection aliases.
+    pub fn qualify(&self, predicate: Column) -> Self {
+        Self {
+            plan: self.plan.qualify(predicate),
+        }
+    }
+
     /// Select column names, expressions or aliased projections.
     pub fn select(&self, projections: impl IntoIterator<Item = impl Into<Projection>>) -> Self {
         Self {
@@ -178,6 +192,18 @@ impl DataFrame {
     pub fn limit(&self, count: u64) -> Self {
         Self {
             plan: self.plan.limit(count),
+        }
+    }
+
+    /// Return the first `count` rows. Use a sort to make the selection deterministic.
+    pub fn head(&self, count: u64) -> Self {
+        self.limit(count)
+    }
+
+    /// Return the last `count` rows in the current explicit sort order.
+    pub fn tail(&self, count: u64) -> Self {
+        Self {
+            plan: self.plan.tail(count),
         }
     }
 

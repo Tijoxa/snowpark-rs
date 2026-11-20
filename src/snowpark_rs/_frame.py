@@ -105,6 +105,24 @@ class DataFrame:
         )
 
     def filter(self, *predicates: Exprs, **constraints: IntoExpr) -> DataFrame:
+        return self._filter_in("filter", predicates, constraints)
+
+    where = filter
+
+    def having(self, *predicates: Exprs, **constraints: IntoExpr) -> DataFrame:
+        """Filter grouped or global aggregates using HAVING."""
+        return self._filter_in("having", predicates, constraints)
+
+    def qualify(self, *predicates: Exprs, **constraints: IntoExpr) -> DataFrame:
+        """Filter after computing a window in the projection or predicate."""
+        return self._filter_in("qualify", predicates, constraints)
+
+    def _filter_in(
+        self,
+        clause: Literal["filter", "having", "qualify"],
+        predicates: tuple[Exprs, ...],
+        constraints: dict[str, IntoExpr],
+    ) -> DataFrame:
         conditions = _expressions(predicates, {})
         conditions += tuple(
             pl.col(name) == (value if isinstance(value, pl.Expr) else pl.lit(value))
@@ -115,7 +133,7 @@ class DataFrame:
 
         return self._then(
             lambda frame: frame.polars_filter(
-                conditions, str(PLUGIN_PATH), referenced_frame
+                conditions, str(PLUGIN_PATH), referenced_frame, clause
             )
         )
 
@@ -130,6 +148,8 @@ class DataFrame:
         self, *by: Exprs, maintain_order: bool = False, **named_by: IntoExpr
     ) -> GroupBy:
         return GroupBy(self, _expressions(by, named_by), maintain_order)
+
+    groupby = group_by
 
     def agg(self, *exprs: Exprs, **named_exprs: IntoExpr) -> DataFrame:
         """Run global reductions, also available through select()."""
@@ -166,10 +186,22 @@ class DataFrame:
 
         return self._then(compile_sort)
 
+    order_by = sort
+
     def limit(self, n: int = 5, *, offset: int = 0) -> DataFrame:
         if n < 0 or offset < 0:
             raise ValueError("limit and offset must be non-negative")
         return self._then(lambda frame: frame.limit(n, offset))
+
+    def head(self, n: int = 5) -> DataFrame:
+        """Return at most the first n rows as a lazy DataFrame."""
+        return self.limit(n)
+
+    def tail(self, n: int = 5) -> DataFrame:
+        """Return at most the last n rows in the current explicit sort order."""
+        if n < 0:
+            raise ValueError("tail count must be non-negative")
+        return self._then(lambda frame: frame.tail(n))
 
     def rename(self, mapping: Mapping[str, str], *, strict: bool = True) -> DataFrame:
         names = tuple(mapping.items())
@@ -201,6 +233,8 @@ class DataFrame:
 
     def unique(self) -> DataFrame:
         return self._then(_Frame.distinct)
+
+    distinct = unique
 
     def union(self, other: DataFrame) -> DataFrame:
         return self._then(lambda frame: frame.union(other._native, False, False, False))

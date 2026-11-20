@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::{cell::Cell, collections::HashSet, sync::Arc};
 
 use crate::{
     BindValue, CompiledQuery, DataType, Field, JoinType, Projection, SortKey, col,
     expr::{Aggregate, BinaryOp, Expr},
     ident::Ident,
-    plan::{LogicalPlan, UnionAlignment},
+    plan::{LogicalPlan, PredicateClause, UnionAlignment},
 };
 
 /// An invalid name, expression or column reference in a DataFrame plan.
@@ -34,6 +34,18 @@ pub enum CompileError {
     ExpectedAggregate,
     #[error("aggregate expressions must appear directly in agg")]
     UnexpectedAggregate,
+    #[error(
+        "having requires an aggregation in the current query block before qualify, distinct or limit"
+    )]
+    HavingWithoutAggregate,
+    #[error("qualify requires a window expression in its predicate or in the current projection")]
+    QualifyWithoutWindow,
+    #[error("window expressions require a row projection or a qualify predicate")]
+    UnexpectedWindow,
+    #[error("over expects a COUNT, SUM or ROW_NUMBER with an explicit ordering")]
+    InvalidWindow,
+    #[error("tail requires an explicit sort with at least one key")]
+    TailWithoutOrder,
     #[error("an intermediate sort must be followed by limit before further transformations")]
     IntermediateSort,
     #[error("both sides of a join require named outputs from a schema or an explicit projection")]
@@ -75,6 +87,16 @@ pub(crate) fn schema(plan: &LogicalPlan) -> Result<Option<Vec<Field>>, CompileEr
     Ok(columns.and_then(|columns| columns.into_iter().map(Output::into_field).collect()))
 }
 
+pub(crate) fn clause_input_schema(plan: &LogicalPlan) -> Result<Option<Vec<Field>>, CompileError> {
+    let block = Compiler::default().block(plan)?;
+    let columns = if block.distinct || block.limit.is_some() {
+        block.finish().1
+    } else {
+        block.columns
+    };
+    Ok(columns.and_then(|columns| columns.into_iter().map(Output::into_field).collect()))
+}
+
 #[derive(Default)]
 struct Compiler {
     next_alias: usize,
@@ -91,6 +113,9 @@ impl Compiler {
             projection: None,
             distinct: false,
             predicate: None,
+            having: None,
+            qualify: None,
+            grouped: false,
             group_keys: 0,
             order: None,
             limit: None,
@@ -115,27 +140,17 @@ impl Compiler {
                     .as_ref()
                     .map(|schema| schema.iter().map(Output::from).collect()),
             )),
-            LogicalPlan::Filter { input, predicate } => {
-                let mut block = self.block(input)?;
-                block.check_intermediate_order()?;
-                if block.projection.is_some()
-                    || block.predicate.is_some()
-                    || block.limit.is_some()
-                    || block.distinct
-                {
-                    block = self.subquery(block.finish());
-                }
-                let mut sql = CompiledQuery::default();
-                block.scope(input).emit_expr(predicate, &mut sql, false)?;
-                block.predicate = Some(sql);
-                Ok(block)
-            }
+            LogicalPlan::Filter {
+                input,
+                predicate,
+                clause,
+            } => self.filter(input, predicate, *clause),
             LogicalPlan::Project { input, projections } => {
                 if projections.is_empty() {
                     return Err(CompileError::EmptyProjection);
                 }
                 let mut block = self.projection_input(input)?;
-                block.projection = Some(block.scope(input).project(projections, &[])?);
+                block.project(input, projections, &[], true)?;
                 Ok(block)
             }
             LogicalPlan::ScalarProject { input, projections } => {
@@ -150,7 +165,7 @@ impl Compiler {
                     },
                     Some(Vec::new()),
                 );
-                block.projection = Some(block.scope(input).project(projections, &[])?);
+                block.project(input, projections, &[], false)?;
                 Ok(block)
             }
             LogicalPlan::Aggregate {
@@ -162,7 +177,8 @@ impl Compiler {
                     return Err(CompileError::EmptyAggregate);
                 }
                 let mut block = self.projection_input(input)?;
-                block.projection = Some(block.scope(input).project(keys, aggregates)?);
+                block.project(input, keys, aggregates, false)?;
+                block.grouped = true;
                 block.group_keys = keys.len();
                 Ok(block)
             }
@@ -172,7 +188,7 @@ impl Compiler {
                 if block.projection.is_some() || block.limit.is_some() {
                     block = self.subquery(block.finish());
                 }
-                block.order = Some(block.scope(input).sort(keys)?);
+                block.set_order(input, keys, false)?;
                 Ok(block)
             }
             LogicalPlan::Limit {
@@ -182,11 +198,16 @@ impl Compiler {
             } => {
                 let mut block = self.block(input)?;
                 if block.limit.is_some() {
+                    let order = block.order.clone();
                     block = self.subquery(block.finish());
+                    if let Some(order) = order {
+                        block.set_order(&order.input, &order.keys, false)?;
+                    }
                 }
                 block.limit = Some((*count, *offset));
                 Ok(block)
             }
+            LogicalPlan::Tail { input, count } => self.tail(input, *count),
             LogicalPlan::Join {
                 left,
                 right,
@@ -220,10 +241,86 @@ impl Compiler {
         }
     }
 
+    fn filter(
+        &mut self,
+        input: &LogicalPlan,
+        predicate: &Expr,
+        clause: PredicateClause,
+    ) -> Result<Block, CompileError> {
+        let mut block = self.block(input)?;
+        block.check_intermediate_order()?;
+        match clause {
+            PredicateClause::Where => {
+                if block.projection.is_some()
+                    || block.predicate.is_some()
+                    || block.qualify.is_some()
+                    || block.limit.is_some()
+                    || block.distinct
+                {
+                    block = self.subquery(block.finish());
+                }
+                let mut sql = CompiledQuery::default();
+                block.scope(input).emit_expr(predicate, &mut sql, false)?;
+                block.predicate = Some(sql);
+            }
+            PredicateClause::Having => {
+                if !block.grouped
+                    || block.qualify.is_some()
+                    || block.distinct
+                    || block.limit.is_some()
+                {
+                    return Err(CompileError::HavingWithoutAggregate);
+                }
+                let sql = block.emit_clause(input, predicate, None)?;
+                block.having = Some(and_predicates(block.having.take(), sql));
+            }
+            PredicateClause::Qualify => {
+                if block.distinct || block.limit.is_some() {
+                    block = self.subquery(block.finish());
+                }
+                let has_window = Cell::new(
+                    block.qualify.is_some()
+                        || block
+                            .projection
+                            .as_ref()
+                            .is_some_and(|projection| projection.has_window),
+                );
+                let sql = block.emit_clause(input, predicate, Some(&has_window))?;
+                if !has_window.get() {
+                    return Err(CompileError::QualifyWithoutWindow);
+                }
+                block.qualify = Some(and_predicates(block.qualify.take(), sql));
+            }
+        }
+        Ok(block)
+    }
+
+    fn tail(&mut self, input: &LogicalPlan, count: u64) -> Result<Block, CompileError> {
+        let mut block = self.block(input)?;
+        let order = block.order.clone().ok_or(CompileError::TailWithoutOrder)?;
+        if order.keys.is_empty() {
+            return Err(CompileError::TailWithoutOrder);
+        }
+        if block.limit.is_some() {
+            block = self.subquery(block.finish());
+        }
+        block.set_order(&order.input, &order.keys, true)?;
+        block.limit = Some((count, 0));
+
+        let mut block = self.subquery(block.finish());
+        block.set_order(&order.input, &order.keys, false)?;
+        block.limit = Some((count, 0));
+        Ok(block)
+    }
+
     fn projection_input(&mut self, input: &LogicalPlan) -> Result<Block, CompileError> {
         let mut block = self.block(input)?;
         block.check_intermediate_order()?;
-        if block.projection.is_some() || block.limit.is_some() || block.distinct {
+        if block.projection.is_some()
+            || block.qualify.is_some()
+            || block.limit.is_some()
+            || block.distinct
+        {
             block = self.subquery(block.finish());
         }
         Ok(block)
@@ -231,7 +328,7 @@ impl Compiler {
 
     fn with_column(
         &mut self,
-        input: &LogicalPlan,
+        input: &Arc<LogicalPlan>,
         name: &str,
         expr: &Expr,
         keep_column_order: bool,
@@ -256,7 +353,7 @@ impl Compiler {
             }
             None => projections.push(column),
         }
-        block.projection = Some(block.scope(input).project(&projections, &[])?);
+        block.project(input, &projections, &[], true)?;
         Ok(block)
     }
 
@@ -304,6 +401,7 @@ impl Compiler {
                 binds: Vec::new(),
             },
             columns,
+            ..Projected::default()
         });
         Ok(block)
     }
@@ -366,6 +464,8 @@ impl Compiler {
         let scope = Scope {
             left: left_relation,
             right: Some(right_relation),
+            outputs: None,
+            has_window: None,
         };
         let mut on = CompiledQuery::default();
         scope.emit_expr(condition, &mut on, false)?;
@@ -525,6 +625,16 @@ fn output_names(columns: &[Output]) -> Vec<&Ident> {
         .collect()
 }
 
+fn and_predicates(previous: Option<CompiledQuery>, predicate: CompiledQuery) -> CompiledQuery {
+    let Some(previous) = previous else {
+        return predicate;
+    };
+    let mut sql = parenthesized(previous);
+    sql.sql.push_str(" AND ");
+    sql.append(parenthesized(predicate));
+    sql
+}
+
 fn validate_names(columns: &[Output], unknown: CompileError) -> Result<(), CompileError> {
     let mut names = HashSet::with_capacity(columns.len());
     for output in columns {
@@ -613,6 +723,7 @@ fn union_by_name(
     Ok(Some(columns))
 }
 
+#[derive(Clone, Copy)]
 struct Relation<'a> {
     plan: &'a LogicalPlan,
     alias: usize,
@@ -638,9 +749,12 @@ impl<'a> Relation<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Scope<'a> {
     left: Relation<'a>,
     right: Option<Relation<'a>>,
+    outputs: Option<(&'a LogicalPlan, &'a Projected)>,
+    has_window: Option<&'a Cell<bool>>,
 }
 
 impl Scope<'_> {
@@ -710,8 +824,7 @@ impl Scope<'_> {
         }
         match expr {
             Expr::Reference { name, relation } => {
-                let (alias, ident) = self.reference(name, relation.as_deref())?;
-                query.sql.push_str(&format!("t{alias}.{ident}"));
+                self.emit_reference(name, relation.as_deref(), query)?;
             }
             Expr::Literal(value) => {
                 match value {
@@ -830,9 +943,110 @@ impl Scope<'_> {
                 self.emit_aggregate(aggregate, query)?
             }
             Expr::Aggregate(_) => return Err(CompileError::UnexpectedAggregate),
+            Expr::Over {
+                function,
+                partition_by,
+                order_by,
+            } => self.emit_window(function, partition_by, order_by, query, allow_aggregate)?,
+            Expr::RowNumber => return Err(CompileError::InvalidWindow),
         }
         if parens {
             query.sql.push(')');
+        }
+        Ok(())
+    }
+
+    fn emit_reference(
+        &self,
+        name: &str,
+        relation: Option<&LogicalPlan>,
+        query: &mut CompiledQuery,
+    ) -> Result<(), CompileError> {
+        let mut source = relation;
+        if let Some((plan, projection)) = self.outputs
+            && relation.is_none_or(|relation| std::ptr::eq(relation, plan))
+        {
+            let ident = Ident::parse(name)?;
+            let columns = projection.columns.as_deref().unwrap_or_default();
+            let matches = columns
+                .iter()
+                .filter(|column| column.name.as_ref() == Some(&ident))
+                .count();
+            if matches > 1 {
+                return Err(CompileError::AmbiguousColumn(name.to_owned()));
+            }
+            if let Some(alias) = projection.aliases.iter().find(|alias| alias.name == ident) {
+                let may_collide = self.left.columns.is_none_or(|columns| {
+                    columns
+                        .iter()
+                        .any(|column| column.name.as_ref() == Some(&ident))
+                });
+                if may_collide && alias.group_key {
+                    // A group key is constant within its group. ANY_VALUE also lets us
+                    // reference keys with binds, which acquire new positions in this clause.
+                    query.sql.push_str("ANY_VALUE(");
+                    query.append(alias.expression.clone());
+                    query.sql.push(')');
+                } else if may_collide {
+                    query.append(parenthesized(alias.expression.clone()));
+                } else {
+                    query.sql.push_str(&ident.to_string());
+                }
+                return Ok(());
+            }
+            if relation.is_some() {
+                if matches == 0 && projection.columns.is_some() {
+                    return Err(CompileError::UnknownColumn(name.to_owned()));
+                }
+                source = None;
+            }
+        }
+        let (alias, ident) = self.reference(name, source)?;
+        query.sql.push_str(&format!("t{alias}.{ident}"));
+        Ok(())
+    }
+
+    fn emit_window(
+        &self,
+        function: &Expr,
+        partition_by: &[Expr],
+        order_by: &[SortKey],
+        query: &mut CompiledQuery,
+        allow_aggregate: bool,
+    ) -> Result<(), CompileError> {
+        let has_window = self.has_window.ok_or(CompileError::UnexpectedWindow)?;
+        has_window.set(true);
+        let scope = Self {
+            has_window: None,
+            outputs: None,
+            ..*self
+        };
+        let sum_or_zero = matches!(function, Expr::Aggregate(Aggregate::SumOrZero(_)));
+        match function {
+            Expr::Aggregate(aggregate) => scope.emit_aggregate_call(aggregate, query)?,
+            Expr::RowNumber if !order_by.is_empty() => query.sql.push_str("ROW_NUMBER()"),
+            _ => return Err(CompileError::InvalidWindow),
+        }
+        query.sql.push_str(" OVER (");
+        if !partition_by.is_empty() {
+            query.sql.push_str("PARTITION BY ");
+            for (index, expr) in partition_by.iter().enumerate() {
+                if index > 0 {
+                    query.sql.push_str(", ");
+                }
+                scope.emit_expression(expr, query, false, allow_aggregate)?;
+            }
+        }
+        if !order_by.is_empty() {
+            if !partition_by.is_empty() {
+                query.sql.push(' ');
+            }
+            query.sql.push_str("ORDER BY ");
+            scope.emit_sort_keys(order_by, query, false, allow_aggregate)?;
+        }
+        query.sql.push(')');
+        if sum_or_zero {
+            query.sql.push_str(", 0)");
         }
         Ok(())
     }
@@ -1031,7 +1245,8 @@ impl Scope<'_> {
             }
             Expr::Aggregate(Aggregate::CountAll | Aggregate::Count(_)) => (None, Some(false)),
             Expr::Aggregate(Aggregate::Sum(_)) => (None, Some(true)),
-            Expr::Aggregate(Aggregate::SumOrZero(_)) => (None, Some(false)),
+            Expr::Aggregate(Aggregate::SumOrZero(_)) | Expr::RowNumber => (None, Some(false)),
+            Expr::Over { function, .. } => self.expression_type(function)?,
         })
     }
 
@@ -1039,8 +1254,14 @@ impl Scope<'_> {
         &self,
         keys: &[Projection],
         aggregates: &[Projection],
+        allow_window: bool,
     ) -> Result<Projected, CompileError> {
         let mut result = Projected::default();
+        let has_window = Cell::new(false);
+        let scope = Scope {
+            has_window: allow_window.then_some(&has_window),
+            ..*self
+        };
         let mut columns = Vec::new();
         let projections = keys
             .iter()
@@ -1061,15 +1282,25 @@ impl Scope<'_> {
             if index > 0 {
                 result.sql.sql.push_str(", ");
             }
-            self.emit_expression(&projection.expr, &mut result.sql, false, aggregate)?;
+            let mut expression = CompiledQuery::default();
+            scope.emit_expression(&projection.expr, &mut expression, false, aggregate)?;
             let name = if let Some(alias) = &projection.alias {
                 let alias = Ident::parse(alias)?;
+                result.sql.append(expression.clone());
                 result.sql.sql.push_str(&format!(" AS {alias}"));
+                result.aliases.push(SelectAlias {
+                    name: alias.clone(),
+                    expression,
+                    group_key: !aggregate && !aggregates.is_empty(),
+                });
                 Some(alias)
-            } else if let Expr::Reference { name, .. } = &projection.expr {
-                Some(Ident::parse(name)?)
             } else {
-                None
+                result.sql.append(expression);
+                if let Expr::Reference { name, .. } = &projection.expr {
+                    Some(Ident::parse(name)?)
+                } else {
+                    None
+                }
             };
             let (data_type, nullable) = self.expression_type(&projection.expr)?;
             columns.push(Output {
@@ -1079,10 +1310,23 @@ impl Scope<'_> {
             });
         }
         result.columns = Some(columns);
+        result.has_window = has_window.get();
         Ok(result)
     }
 
     fn emit_aggregate(
+        &self,
+        aggregate: &Aggregate,
+        query: &mut CompiledQuery,
+    ) -> Result<(), CompileError> {
+        self.emit_aggregate_call(aggregate, query)?;
+        if matches!(aggregate, Aggregate::SumOrZero(_)) {
+            query.sql.push_str(", 0)");
+        }
+        Ok(())
+    }
+
+    fn emit_aggregate_call(
         &self,
         aggregate: &Aggregate,
         query: &mut CompiledQuery,
@@ -1098,35 +1342,45 @@ impl Scope<'_> {
         };
         query.sql.push_str(function);
         query.sql.push('(');
-        self.emit_expr(arg, query, false)?;
-        query.sql.push(')');
-        if matches!(aggregate, Aggregate::SumOrZero(_)) {
-            query.sql.push_str(", 0)");
+        // Aggregate inputs refer to source rows even when a projection alias has the same name.
+        Self {
+            outputs: None,
+            has_window: None,
+            ..*self
         }
+        .emit_expr(arg, query, false)?;
+        query.sql.push(')');
         Ok(())
     }
 
-    fn sort(&self, keys: &[SortKey]) -> Result<CompiledQuery, CompileError> {
-        let mut query = CompiledQuery::default();
+    fn emit_sort_keys(
+        &self,
+        keys: &[SortKey],
+        query: &mut CompiledQuery,
+        reverse: bool,
+        allow_aggregate: bool,
+    ) -> Result<(), CompileError> {
         if keys.is_empty() {
             query.sql.push_str("ALL");
-            return Ok(query);
+            return Ok(());
         }
         for (index, key) in keys.iter().enumerate() {
             if index > 0 {
                 query.sql.push_str(", ");
             }
-            self.emit_expr(&key.expr, &mut query, false)?;
-            query
-                .sql
-                .push_str(if key.ascending { " ASC" } else { " DESC" });
-            query.sql.push_str(if key.nulls_first {
+            self.emit_expression(&key.expr, query, false, allow_aggregate)?;
+            query.sql.push_str(if key.ascending != reverse {
+                " ASC"
+            } else {
+                " DESC"
+            });
+            query.sql.push_str(if key.nulls_first != reverse {
                 " NULLS FIRST"
             } else {
                 " NULLS LAST"
             });
         }
-        Ok(query)
+        Ok(())
     }
 }
 
@@ -1134,6 +1388,22 @@ impl Scope<'_> {
 struct Projected {
     sql: CompiledQuery,
     columns: Option<Columns>,
+    input: Option<Arc<LogicalPlan>>,
+    aliases: Vec<SelectAlias>,
+    has_window: bool,
+}
+
+struct SelectAlias {
+    name: Ident,
+    expression: CompiledQuery,
+    group_key: bool,
+}
+
+#[derive(Clone)]
+struct Order {
+    input: Arc<LogicalPlan>,
+    keys: Vec<SortKey>,
+    sql: CompiledQuery,
 }
 
 struct Block {
@@ -1143,8 +1413,11 @@ struct Block {
     projection: Option<Projected>,
     distinct: bool,
     predicate: Option<CompiledQuery>,
+    having: Option<CompiledQuery>,
+    qualify: Option<CompiledQuery>,
+    grouped: bool,
     group_keys: usize,
-    order: Option<CompiledQuery>,
+    order: Option<Order>,
     limit: Option<(u64, u64)>,
 }
 
@@ -1161,7 +1434,54 @@ impl Block {
         Scope {
             left: self.relation(plan),
             right: None,
+            outputs: None,
+            has_window: None,
         }
+    }
+
+    fn project(
+        &mut self,
+        input: &Arc<LogicalPlan>,
+        keys: &[Projection],
+        aggregates: &[Projection],
+        allow_window: bool,
+    ) -> Result<(), CompileError> {
+        let mut projected = self.scope(input).project(keys, aggregates, allow_window)?;
+        projected.input = Some(Arc::clone(input));
+        self.projection = Some(projected);
+        Ok(())
+    }
+
+    fn emit_clause(
+        &self,
+        input: &LogicalPlan,
+        predicate: &Expr,
+        has_window: Option<&Cell<bool>>,
+    ) -> Result<CompiledQuery, CompileError> {
+        let projection = self.projection.as_ref();
+        let mut scope = self.scope(projection.and_then(|p| p.input.as_deref()).unwrap_or(input));
+        scope.outputs = projection.map(|projection| (input, projection));
+        scope.has_window = has_window;
+        let mut sql = CompiledQuery::default();
+        scope.emit_expression(predicate, &mut sql, false, self.grouped)?;
+        Ok(sql)
+    }
+
+    fn set_order(
+        &mut self,
+        input: &Arc<LogicalPlan>,
+        keys: &[SortKey],
+        reverse: bool,
+    ) -> Result<(), CompileError> {
+        let mut sql = CompiledQuery::default();
+        self.scope(input)
+            .emit_sort_keys(keys, &mut sql, reverse, false)?;
+        self.order = Some(Order {
+            input: Arc::clone(input),
+            keys: keys.to_vec(),
+            sql,
+        });
+        Ok(())
     }
 
     fn check_intermediate_order(&self) -> Result<(), CompileError> {
@@ -1201,9 +1521,17 @@ impl Block {
                 query.sql.push_str(&format!(", {position}"));
             }
         }
+        if let Some(predicate) = self.having {
+            query.sql.push_str("\nHAVING ");
+            query.append(predicate);
+        }
+        if let Some(predicate) = self.qualify {
+            query.sql.push_str("\nQUALIFY ");
+            query.append(predicate);
+        }
         if let Some(order) = self.order {
             query.sql.push_str("\nORDER BY ");
-            query.append(order);
+            query.append(order.sql);
         }
         if let Some((count, offset)) = self.limit {
             query.sql.push_str(&format!("\nLIMIT {count}"));

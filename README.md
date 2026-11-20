@@ -26,7 +26,7 @@ assert binds == [2, 100, "EU"]
 ```
 
 `Table` builds a lazy Snowflake query. `select`, `filter`, `with_columns`,
-`group_by().agg()` and `sort` take Polars expressions. Pass a column name as
+`group_by().agg()`, `having`, `qualify` and `sort` take Polars expressions. Pass a column name as
 a string or use `pl.lit("value")` for a string value in a projection. Both
 `to_sql()` and the execution methods translate the expressions before
 sending any SQL. An unsupported expression raises
@@ -39,8 +39,17 @@ source = pls.Table("PUBLIC.PUBLIC.SALES")
 totals = (
     source.group_by("CATEGORY")
     .agg(rows=pl.len(), total=pl.col("AMOUNT").sum())
+    .having(pl.col("total") > 100)
     .sort("total", descending=True, nulls_last=True)
-    .limit(10)
+    .head(10)
+)
+
+repeated_categories = (
+    source.select("CATEGORY", rows=pl.len().over("CATEGORY"))
+    .qualify(pl.col("rows") > 1)
+    .distinct()
+    .sort("CATEGORY")
+    .tail(5)
 )
 
 left = source.select("ID", "NAME")
@@ -52,9 +61,20 @@ The compiler supports column references, scalar literals, aliases, comparisons,
 null tests, Boolean logic, numeric arithmetic, a subset of strict casts,
 `sum()`, `count()` and `pl.len()`. `sum()` returns zero for an empty or
 all-null input. Polars-style null placement is explicit in `ORDER BY`.
-True division requires a nonzero literal divisor. Windows, list reductions,
-and broadcasting aggregates over source rows produce an error.
-A sort can end a query or precede a limit.
+True division requires a nonzero literal divisor. The supported Polars windows
+are `sum()`, `count()` and `pl.len()` over whole partitions with the default
+`groups_to_rows` mapping. Rust also exposes `row_number(partition_by, order_by)`.
+
+Call `having` on an aggregation to filter groups by keys, aggregates, or
+their aliases. Call `qualify` with a window function in the current projection
+or in the predicate. Apply `distinct`, `sort` and `limit` after these clauses
+to shape the filtered result.
+
+`head(n)` is shorthand for `limit(n)`. `tail(n)` uses the current explicit sort
+and returns the last rows in that same order. Add a unique tie-breaker to the
+sort keys when rows with equal keys must be selected deterministically.
+Python accepts `where`, `groupby`, `order_by` and `distinct` as aliases for
+`filter`, `group_by`, `sort` and `unique`.
 
 ### Dates, datetimes, and membership
 

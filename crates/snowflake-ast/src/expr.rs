@@ -55,7 +55,28 @@ pub fn sum(column: impl Into<Column>) -> Column {
     Column(Expr::Aggregate(Aggregate::Sum(Box::new(column.into().0))))
 }
 
+/// Number rows within each partition using explicit sort keys.
+pub fn row_number(
+    partition_by: impl IntoIterator<Item = Column>,
+    order_by: impl IntoIterator<Item = SortKey>,
+) -> Column {
+    Column(Expr::Over {
+        function: Box::new(Expr::RowNumber),
+        partition_by: partition_by.into_iter().map(|column| column.0).collect(),
+        order_by: order_by.into_iter().collect(),
+    })
+}
+
 impl Column {
+    /// Compute a COUNT or SUM over every row in the specified partition.
+    pub fn over(self, partition_by: impl IntoIterator<Item = Column>) -> Self {
+        Self(Expr::Over {
+            function: Box::new(self.0),
+            partition_by: partition_by.into_iter().map(|column| column.0).collect(),
+            order_by: Vec::new(),
+        })
+    }
+
     pub fn date_from_epoch_days(days: i64) -> Self {
         Self(Expr::DateFromEpochDays(days))
     }
@@ -292,6 +313,12 @@ pub(crate) enum Expr {
         relation: Option<Arc<LogicalPlan>>,
     },
     Aggregate(Aggregate),
+    RowNumber,
+    Over {
+        function: Box<Self>,
+        partition_by: Vec<Self>,
+        order_by: Vec<SortKey>,
+    },
     Literal(BindValue),
     DateFromEpochDays(i64),
     TimestampFromEpoch(i64, TimestampUnit, bool),
@@ -320,6 +347,8 @@ impl Expr {
         match self {
             Self::Aggregate(_) => true,
             Self::Reference { .. }
+            | Self::RowNumber
+            | Self::Over { .. }
             | Self::Literal(_)
             | Self::DateFromEpochDays(_)
             | Self::TimestampFromEpoch(..) => false,
@@ -345,8 +374,9 @@ impl Expr {
 
     pub(crate) fn contains_ungrouped_reference(&self) -> bool {
         match self {
-            Self::Reference { .. } => true,
+            Self::Reference { .. } | Self::Over { .. } => true,
             Self::Aggregate(_)
+            | Self::RowNumber
             | Self::Literal(_)
             | Self::DateFromEpochDays(_)
             | Self::TimestampFromEpoch(..) => false,

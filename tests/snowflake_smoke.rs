@@ -3,7 +3,7 @@ use std::{error::Error, time::Duration};
 use arrow_array::{BooleanArray, Decimal128Array, StringArray};
 use futures_util::TryStreamExt;
 use snowpark_rs::{
-    DataFrame, Decimal, JoinType, Session, col, count, count_all, lit, lit_null,
+    DataFrame, Decimal, JoinType, Session, col, count, count_all, lit, lit_null, row_number,
     session::connect_profile, sum,
 };
 
@@ -249,6 +249,48 @@ fn snowflake_three_valued_logic_on_nullable_cells() -> Result<(), Box<dyn Error>
                 .await?;
             assert_eq!(decimals(&filtered, 0).values().as_ref(), expected);
         }
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires a named Snowflake profile and the PUBLIC.PUBLIC.EXAMPLE fixture"]
+fn snowflake_filters_groups_and_windows_before_selecting_the_tail() -> Result<(), Box<dyn Error>> {
+    with_session(async |session| {
+        let source = DataFrame::table_name("PUBLIC.PUBLIC.EXAMPLE")?;
+        let groups = source
+            .group_by(["category"])
+            .agg([sum("amount").alias("total")])
+            .having(col("total").gt(lit(20)));
+        let rank = row_number([], [col("total").desc()]);
+        let result = groups
+            .select([col("category").into(), rank.alias("position")])
+            .qualify(col("position").le(lit(2)))
+            .distinct()
+            .sort(["position"])
+            .head(10)
+            .tail(2)
+            .to_arrow(&session)
+            .await?;
+        let categories = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            categories.iter().collect::<Vec<_>>(),
+            [Some("B"), Some("A")]
+        );
+        assert_eq!(decimals(&result, 1).values().as_ref(), &[1, 2]);
+
+        let smallest = source
+            .select(["category", "amount"])
+            .group_by([col("category").eq(lit("C")).alias("category")])
+            .agg([count_all().alias("rows")])
+            .having(col("category"))
+            .to_arrow(&session)
+            .await?;
+        assert_eq!(smallest.num_rows(), 1);
         Ok(())
     })
 }

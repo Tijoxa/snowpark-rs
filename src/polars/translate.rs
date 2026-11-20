@@ -9,7 +9,7 @@ use polars_core::{
 use polars_plan::{
     dsl::{
         AggExpr, BooleanFunction, DataTypeExpr, Expr, FunctionExpr, Operator, PowFunction,
-        Selector, TemporalFunction,
+        Selector, TemporalFunction, WindowMapping,
     },
     prelude::{DynLiteralValue, LiteralValue},
 };
@@ -17,8 +17,8 @@ use snowflake_ast::TimestampUnit;
 
 use super::{AstFrame, Context, Result, unsupported};
 use crate::{
-    BindValue, Column, CompileError, DataType, Decimal, Projection, col, count, count_all, lit,
-    lit_null,
+    BindValue, Column, CompileError, DataType, Decimal, Field, Projection, col, count, count_all,
+    lit, lit_null,
 };
 
 pub(super) const BROADCAST: &str = "broadcasting a reduction over input rows is unsupported";
@@ -26,6 +26,8 @@ pub(super) const DECLARE_SCHEMA: &str = "declare the source schema or select nam
 const NO_TRANSLATION: &str = "no translation to Snowflake SQL";
 const ROW_COUNT: DataType = number(10, 0);
 const SUBQUERY_PREFIX: &str = "snowpark_rs:membership:";
+
+type SchemaColumns = Vec<(String, Option<DataType>)>;
 
 pub(super) fn identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -99,7 +101,8 @@ impl Value {
 pub(super) struct Translator<'a> {
     operation: &'static str,
     context: &'a Context<'a>,
-    pub(super) schema: Option<Vec<(String, Option<DataType>)>>,
+    pub(super) schema: Option<SchemaColumns>,
+    clause_source: Option<Option<SchemaColumns>>,
 }
 
 impl<'a> Translator<'a> {
@@ -108,17 +111,16 @@ impl<'a> Translator<'a> {
         operation: &'static str,
         context: &'a Context<'a>,
     ) -> Result<Self> {
-        let schema = input.schema()?.map(|fields| {
-            fields
-                .into_iter()
-                .map(|field| (field_name(&field.name()), field.data_type))
-                .collect()
-        });
         Ok(Self {
             operation,
             context,
-            schema,
+            schema: input.schema()?.map(schema_columns),
+            clause_source: None,
         })
+    }
+
+    pub(super) fn set_clause_source(&mut self, source: Option<Vec<Field>>) {
+        self.clause_source = Some(source.map(schema_columns));
     }
 
     pub(super) fn for_operation(mut self, operation: &'static str) -> Self {
@@ -134,7 +136,10 @@ impl<'a> Translator<'a> {
         let mut output = Vec::new();
         for expr in expressions {
             for expr in self.expand(expr)? {
-                let value = self.visit(&expr, self.operation == "filter")?;
+                let value = self.visit(
+                    &expr,
+                    matches!(self.operation, "filter" | "having" | "qualify"),
+                )?;
                 let reference = match unalias(&expr) {
                     Expr::Column(name) => Some(name.to_string()),
                     _ => None,
@@ -208,21 +213,7 @@ impl<'a> Translator<'a> {
         match expr {
             Expr::Alias(inner, _) => self.visit(inner, allow_subquery),
             Expr::Column(name) => {
-                let dtype = match &self.schema {
-                    Some(fields) => {
-                        fields
-                            .iter()
-                            .find(|(field, _)| field == name.as_str())
-                            .ok_or_else(|| {
-                                self.error(
-                                    "Column",
-                                    format!("{name:?} is absent from the input schema"),
-                                )
-                            })?
-                            .1
-                    }
-                    None => None,
-                };
+                let dtype = self.column_type(name)?;
                 Ok(Value::new(col(identifier(name)), Shape::Row, dtype))
             }
             Expr::Literal(literal) => self.literal(literal),
@@ -249,14 +240,73 @@ impl<'a> Translator<'a> {
                 Ok(Value::new(count_all(), Shape::Aggregate, Some(ROW_COUNT)))
             }
             Expr::Len => Ok(Value::new(count_all(), Shape::Aggregate, Some(ROW_COUNT))),
+            Expr::Over {
+                function,
+                partition_by,
+                order_by: None,
+                mapping: WindowMapping::GroupsToRows,
+            } => self.window(function, partition_by),
             Expr::Over { .. } => Err(self.error(
                 "Over",
-                "window expressions require a supported deterministic ordering",
+                "supported windows use a single sum, count or len reduction and groups_to_rows without order_by",
             )),
             Expr::AnonymousFunction { .. } => Err(self.error("AnonymousFunction", NO_TRANSLATION)),
             Expr::Agg(_) => Err(self.error("Agg", format!("{NO_TRANSLATION} for {expr:?}"))),
             Expr::Cast { .. } => Err(self.error("Cast", "a concrete Polars dtype is required")),
             _ => Err(self.error(format!("{expr:?}"), NO_TRANSLATION)),
+        }
+    }
+
+    fn column_type(&self, name: &str) -> Result<Option<DataType>> {
+        let lookup = |fields: &[(String, Option<DataType>)]| {
+            fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|field| field.1)
+        };
+        if let Some(dtype) = self.schema.as_deref().and_then(lookup) {
+            return Ok(dtype);
+        }
+        match self.clause_source.as_ref().unwrap_or(&self.schema) {
+            None => Ok(None),
+            Some(fields) => lookup(fields).ok_or_else(|| {
+                self.error(
+                    "Column",
+                    format!("{name:?} is absent from the input schema"),
+                )
+            }),
+        }
+    }
+
+    fn window(&self, function: &Expr, partition_by: &[Expr]) -> Result<Value> {
+        let source = self.source_translator();
+        let function = source.visit(function, false)?;
+        if function.shape != Shape::Aggregate {
+            return Err(self.error("Over", "a sum, count or len window reduction is required"));
+        }
+        let keys = source.expressions(partition_by)?;
+        if keys
+            .iter()
+            .any(|key| key.shape == Shape::Aggregate || key.untyped_null)
+        {
+            return Err(self.error(
+                "Over",
+                "partition keys must be row expressions or typed literals",
+            ));
+        }
+        Ok(Value::new(
+            function.column.over(keys.into_iter().map(|key| key.column)),
+            Shape::Row,
+            function.dtype,
+        ))
+    }
+
+    fn source_translator(&self) -> Self {
+        Self {
+            operation: self.operation,
+            context: self.context,
+            schema: self.clause_source.as_ref().unwrap_or(&self.schema).clone(),
+            clause_source: None,
         }
     }
 
@@ -489,6 +539,11 @@ impl<'a> Translator<'a> {
 
     fn combine_shape(&self, node: &str, left: Shape, right: Shape) -> Result<Shape> {
         match (left, right) {
+            (Shape::Row, Shape::Aggregate) | (Shape::Aggregate, Shape::Row)
+                if self.clause_source.is_some() =>
+            {
+                Ok(Shape::Aggregate)
+            }
             (Shape::Row, Shape::Aggregate) | (Shape::Aggregate, Shape::Row) => {
                 Err(self.error(node, BROADCAST))
             }
@@ -799,7 +854,11 @@ impl<'a> Translator<'a> {
     }
 
     fn aggregate(&self, expr: &Expr, is_sum: bool) -> Result<Value> {
-        let mut inner = self.visit(expr, false)?;
+        let mut inner = if self.clause_source.is_some() {
+            self.source_translator().visit(expr, false)?
+        } else {
+            self.visit(expr, false)?
+        };
         let node = if is_sum { "Agg.Sum" } else { "Agg.Count" };
         if inner.shape == Shape::Aggregate {
             return Err(self.error(node, "nested aggregates are unsupported"));
@@ -833,6 +892,13 @@ impl<'a> Translator<'a> {
             inner.dtype,
         ))
     }
+}
+
+fn schema_columns(fields: Vec<Field>) -> SchemaColumns {
+    fields
+        .into_iter()
+        .map(|field| (field_name(&field.name()), field.data_type))
+        .collect()
 }
 
 pub(super) fn projections(
@@ -872,6 +938,7 @@ fn output_name(expr: &Expr) -> &str {
         Expr::Alias(_, name) | Expr::Column(name) => name,
         Expr::BinaryExpr { left, .. }
         | Expr::Cast { expr: left, .. }
+        | Expr::Over { function: left, .. }
         | Expr::Agg(AggExpr::Sum(left) | AggExpr::Count { input: left, .. }) => output_name(left),
         Expr::Function { input, .. } if !input.is_empty() => output_name(&input[0]),
         Expr::Len => "len",

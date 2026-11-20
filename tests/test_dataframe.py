@@ -7,6 +7,51 @@ import snowpark_rs as pls
 from snowpark_rs import Field, Table, UnsupportedPolarsExpression
 
 
+def test_having_resolves_projected_aliases_and_source_columns_for_reductions():
+    source = Table("T", schema=[Field("K", "VARCHAR"), Field("X", "NUMBER(10, 0)")])
+    groups = source.where(pl.col("X") > 0).groupby("K").agg(total=pl.col("X").sum())
+    result = groups.having((pl.col("total") > 10) & (pl.col("X").count() > 1), K="A")
+
+    sql, binds = result.to_sql()
+    assert 'GROUP BY 1 HAVING (("total" > ?) AND (COUNT(t0."X") > ?)) AND (t0."K" = ?)' in sql
+    assert binds == [0, 10, 1, "A"]
+    assert result.columns == groups.columns
+
+
+def test_qualify_translates_polars_windows_and_composes_with_result_shaping():
+    source = Table("T", schema=[Field("K", "VARCHAR"), Field("X", "NUMBER(10, 0)")])
+    result = (
+        source.select("K", total=pl.col("X").sum().over("K"))
+        .qualify(pl.col("total") > 10)
+        .distinct()
+        .order_by("K")
+        .head(2)
+    )
+    sql, binds = result.to_sql()
+    assert 'SELECT DISTINCT t0."K", COALESCE(SUM(t0."X") OVER (PARTITION BY t0."K"), 0) AS "total"' in sql
+    assert 'QUALIFY "total" > ?) AS t1 ORDER BY t1."K" ASC NULLS FIRST LIMIT 2' in sql
+    assert binds == [10]
+    assert 'QUALIFY COUNT(*) OVER (PARTITION BY t0."K") > ?' in source.qualify(
+        pl.len().over("K") > 1
+    ).to_sql()[0]
+    with pytest.raises(ValueError, match="qualify requires a window"):
+        source.qualify(pl.col("X") > 1).to_sql()
+
+
+def test_head_and_tail_remain_lazy_and_use_a_nonnegative_count():
+    source = Table("T")
+    assert source.head().to_sql() == source.limit(5).to_sql()
+    assert source.tail(0).to_sql() == source.limit(0).to_sql()
+    sql, binds = source.sort("K", descending=True).tail(2).to_sql()
+    assert 'ORDER BY t0."K" ASC NULLS LAST LIMIT 2)' in sql
+    assert sql.endswith('ORDER BY t1."K" DESC NULLS FIRST LIMIT 2')
+    assert binds == []
+    with pytest.raises(ValueError, match="explicit sort"):
+        source.tail().to_sql()
+    with pytest.raises(ValueError, match="non-negative"):
+        source.tail(-1)
+
+
 @pytest.mark.parametrize(
     ("name", "parts", "sql_name"),
     [

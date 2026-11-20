@@ -23,6 +23,23 @@ pub(crate) struct Context<'a> {
     pub(crate) membership: Option<&'a MembershipResolver<'a>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PredicateClause {
+    Filter,
+    Having,
+    Qualify,
+}
+
+impl PredicateClause {
+    pub(crate) fn operation(self) -> &'static str {
+        match self {
+            Self::Filter => "filter",
+            Self::Having => "having",
+            Self::Qualify => "qualify",
+        }
+    }
+}
+
 /// A Polars sort expression with explicit direction and NULL placement.
 #[derive(Clone)]
 pub struct SortKey {
@@ -43,7 +60,36 @@ impl DataFrame {
     /// Apply a Polars predicate when the Snowflake plan is first resolved.
     pub fn filter_polars(&self, predicate: Expr) -> Self {
         self.defer_polars(move |input| {
-            filter(input, std::slice::from_ref(&predicate), &Context::default())
+            filter(
+                input,
+                std::slice::from_ref(&predicate),
+                &Context::default(),
+                PredicateClause::Filter,
+            )
+        })
+    }
+
+    /// Apply a Polars predicate to the current aggregation.
+    pub fn having_polars(&self, predicate: Expr) -> Self {
+        self.defer_polars(move |input| {
+            filter(
+                input,
+                std::slice::from_ref(&predicate),
+                &Context::default(),
+                PredicateClause::Having,
+            )
+        })
+    }
+
+    /// Apply a Polars predicate after computing windows.
+    pub fn qualify_polars(&self, predicate: Expr) -> Self {
+        self.defer_polars(move |input| {
+            filter(
+                input,
+                std::slice::from_ref(&predicate),
+                &Context::default(),
+                PredicateClause::Qualify,
+            )
         })
     }
 
@@ -132,8 +178,17 @@ pub(crate) fn select(input: &AstFrame, exprs: &[Expr], context: &Context<'_>) ->
     Ok(input.select(output))
 }
 
-pub(crate) fn filter(input: &AstFrame, exprs: &[Expr], context: &Context<'_>) -> Result<AstFrame> {
-    let translator = Translator::new(input, "filter", context)?;
+pub(crate) fn filter(
+    input: &AstFrame,
+    exprs: &[Expr],
+    context: &Context<'_>,
+    clause: PredicateClause,
+) -> Result<AstFrame> {
+    let mut translator = Translator::new(input, clause.operation(), context)?;
+    let filter_rows = matches!(clause, PredicateClause::Filter);
+    if !filter_rows {
+        translator.set_clause_source(input.clause_input_schema()?);
+    }
     let mut predicates = Vec::with_capacity(exprs.len());
     for expr in exprs {
         let [value] = translator
@@ -145,19 +200,28 @@ pub(crate) fn filter(input: &AstFrame, exprs: &[Expr], context: &Context<'_>) ->
                     "a predicate must expand to exactly one expression",
                 )
             })?;
-        if value.shape == Shape::Aggregate
+        if (filter_rows && value.shape == Shape::Aggregate)
             || value.untyped_null
             || value
                 .dtype
                 .is_some_and(|dtype| dtype != crate::DataType::Boolean)
         {
-            return Err(translator.error("predicate", "a row-wise Boolean expression is required"));
+            let reason = if filter_rows {
+                "a row-wise Boolean expression is required"
+            } else {
+                "a Boolean expression is required"
+            };
+            return Err(translator.error("predicate", reason));
         }
         predicates.push(value.column);
     }
-    Ok(match predicates.into_iter().reduce(crate::Column::and) {
-        Some(predicate) => input.filter(predicate),
-        None => input.clone(),
+    let Some(predicate) = predicates.into_iter().reduce(crate::Column::and) else {
+        return Ok(input.clone());
+    };
+    Ok(match clause {
+        PredicateClause::Filter => input.filter(predicate),
+        PredicateClause::Having => input.having(predicate),
+        PredicateClause::Qualify => input.qualify(predicate),
     })
 }
 
