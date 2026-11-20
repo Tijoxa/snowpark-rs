@@ -7,6 +7,10 @@ use crate::CompileError;
 pub(crate) struct Ident(String);
 
 impl Ident {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
     pub(crate) fn normalized(&self) -> String {
         if Self::parse(&self.0).as_ref() == Ok(self) {
             self.0.clone()

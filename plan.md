@@ -14,7 +14,9 @@ Le moteur couvre déjà les projections, les filtres, l’agrégation, le tri, l
 - [x] **Valider l’intégration sur Snowflake.** Les tests d’intégration Rust passent et les tests Python confirment la parité avec Polars sur `PUBLIC.PUBLIC.EXAMPLE`. Un test Rust vérifie aussi que le même DataFrame utilise les tables propres à chacune des deux sessions explicites. Les tests de parité s’activent via `SNOWPARK_RS_TEST_CONNECTION`. [Tests Rust](tests/snowflake_smoke.rs) · [Tests Python](tests/test_polars_snowflake.py)
 - [x] **Ajouter les types, les schémas et les expressions de base.** Exposer `schema` et `columns`, les `NULL` typés, les décimaux exacts, `cast` et l’arithmétique. [Tests Rust](crates/snowflake-ast/tests/types_and_sets.rs) · [Tests Python](tests/test_dataframe.py)
 - [x] **Étendre les transformations relationnelles.** Ajouter `with_column`, `rename`, `distinct`, les jointures externes et les unions par position ou par nom. [Tests Rust](crates/snowflake-ast/tests/types_and_sets.rs) · [Tests Python](tests/test_dataframe.py)
-- [ ] **Élargir le vocabulaire SQL Snowflake selon les besoins de traduction.** Prioriser la résolution des projections et les constructions SQL nécessaires aux premières expressions Polars ou extensions Snowflake. [Pistes SQL Snowflake](#9-vocabulaire-sql-snowflake)
+- [ ] **Généraliser la traduction des expressions Polars composées.** Suivre la cardinalité, la portée et l’ordre à travers les opérations par ligne, les réductions et les sélections dans un groupe. Valider d’abord des expressions courtes, puis `spread_expr` sur une table au schéma de `DB_CH_FC.FC.PRICE`. [Plan de traduction](#composition-des-expressions-polars) · [Cas de validation](#spread-journalier-avec-spread_expr)
+- [x] **Traduire les clés temporelles et les prédicats sur les chaînes.** Couvrir `dt.truncate()` dans les clés de groupe et `str.contains()` en projection et en filtre. [Troncature temporelle](#clés-de-groupe-temporelles-avec-dttruncate) · [Recherche dans les chaînes](#recherche-avec-strcontains)
+- [ ] **Élargir le vocabulaire SQL Snowflake selon les besoins de traduction.** Les projections étoile sont disponibles. Poursuivre avec les constructions SQL nécessaires aux expressions Polars et aux extensions Snowflake. [Pistes SQL Snowflake](#9-vocabulaire-sql-snowflake)
 - [ ] **Prototyper le cache Parquet partitionné.** Configurer `cache_dir` et `ttl` via `Session.builder`, puis activer le cache avec `to_arrow(session, partition_by=[...])` ou `to_polars(session, partition_by=[...])` sur un plan construit avec `Table` et des expressions Polars. Valider les colonnes de partitionnement, stocker les partitions sous `cache_dir / "db.schema.table"` et prévoir la lecture locale avec DataFusion. [Plan du cache](plan_caching.md)
 
 ## Architecture du MVP
@@ -55,6 +57,15 @@ sql, binds = query.to_sql()
 - [x] **Vérifier les traductions hors ligne.** Les tests couvrent les colonnes, alias, littéraux paramétrés, comparaisons, expressions arithmétiques, conversions prises en charge, sélecteurs et l’ordre explicite des `NULL`. La somme produit `COALESCE(SUM(...), 0)` pour les entrées vides ou entièrement nulles. La comparaison des valeurs et types Snowflake reste dans le jalon d’intégration. [Tests Python](tests/test_dataframe.py)
 - [x] **Signaler les traductions non prises en charge.** Lever `UnsupportedPolarsExpression`, une sous-classe de `RuntimeError`, lors de `to_sql()` ou de la compilation déclenchée par une action, avant l’envoi à Snowflake. Indiquer la transformation, le nœud ou la combinaison en cause et la raison, par exemple un sélecteur qui exige le schéma ou une fenêtre dont l’ordre est indéterminé. Tester aussi les expressions inconnues imbriquées et la distinction avec les erreurs d’exécution Snowflake.
 
+### Composition des expressions Polars
+
+Le traducteur produit aujourd’hui une `Column` SQL par expression et distingue `Scalar`, `Row` et `Aggregate`. Une réduction simple comme `col("VALUE").sum()` rentre dans ce modèle. Dans `col("VALUE").filter(predicat).drop_nulls().sort().tail(k).mean()`, la moyenne consomme une série dont le filtre change les lignes, dont le tri fixe l’ordre et dont la taille dépend de `k`. Il faut conserver ces informations jusqu’à la compilation du plan relationnel. [Traducteur partagé](src/polars/translate.rs) · [Planification de `select` et `agg`](src/polars.rs)
+
+- [ ] **Analyser chaque sous-expression avant de produire du SQL.** Suivre son type, sa cardinalité et sa portée. Distinguer une constante pour la requête, une valeur par ligne, une valeur par groupe et une série par groupe dont la longueur ou l’ordre peuvent changer. Évaluer la réutilisation des propriétés de l’IR de la version Polars épinglée, notamment `is_scalar` et `is_length_preserving`, et vérifier la compilation des tables au schéma inconnu. Pour une série, conserver sa source, l’alignement avec les autres séries et l’ordre issu d’un tri explicite. Utiliser ces informations pour vérifier les clés de groupe, les prédicats, la diffusion d’un scalaire et les combinaisons de branches. [Analyse actuelle](src/polars/translate.rs) · [Propriétés de `ExprIR` dans Polars](https://github.com/pola-rs/polars/blob/7f902bd3ffd27ff82d14278a09a295ff2f7aed92/crates/polars-plan/src/plans/expr_ir.rs#L275-L289)
+- [ ] **Composer les opérations par ligne et les réductions usuelles.** Traduire les opérandes récursivement dans la même portée et réutiliser les nœuds SQL existants lorsque leur sémantique convient. Prendre en charge `when/then/otherwise`, `//`, `floor`, `fill_null` et `min_horizontal`, puis `mean`, `any` et `all`, avec les règles Polars de type et de `NULL`. Tester le calcul par ligne, les branches dont la condition dépend d’une réduction, la division entière négative, les entrées vides et les valeurs entièrement nulles. Les fonctions temporelles et textuelles empruntent le même chemin par ligne.
+- [ ] **Compiler les opérations sur une série dans le plan relationnel.** Commencer par les réductions sur `filter` ou `drop_nulls` qui peuvent se traduire en agrégats conditionnels. Ajouter des blocs SQL intermédiaires pour les sélections ordonnées comme `sort().head(k)` et `sort().tail(k)` sous une réduction. Par exemple, calculer `count` sur les prix candidats, calculer `ROW_NUMBER` dans ce même ensemble, puis sélectionner les rangs admissibles avec le `k` du groupe avant `AVG`. Conserver les groupes sans candidat et les clés `NULL`. Garder les sélections distinctes lorsqu’elles portent sur des séries différentes, comme les prix `UP` et `DOWN`. [AST Snowflake](crates/snowflake-ast/src/plan.rs) · [Snowflake `ROW_NUMBER`](https://docs.snowflake.com/en/sql-reference/functions/row_number)
+- [ ] **Valider les compositions et les limites prises en charge.** Partager le chemin entre `select()` avec une réduction globale et `group_by(...).agg(...)`. Tester `mean` filtrée, `count` après `drop_nulls`, `when` sur une réduction, puis les sélections triées avec un `k` fixe et avec un `k` calculé par groupe. Couvrir les ex æquo lorsque la ligne retenue influe sur le résultat, les séries de longueurs différentes et plusieurs réductions portant sur des ensembles distincts. Vérifier d’abord le SQL, les types et l’ordre des binds hors ligne, puis les résultats face à Polars. Les compositions sans équivalence SQL établie doivent indiquer le nœud et la contrainte en cause dans `UnsupportedPolarsExpression`.
+
 ### Comparaisons temporelles et appartenance
 
 - [x] **Comparer les dates et les datetimes.** Traduire les dates Python,
@@ -83,6 +94,79 @@ ids = source.filter(pl.col("CATEGORY") == "A").select("ID")
 source.filter(pl.col("ID").is_in(ids.implode())).to_polars(session)
 source.filter(pl.col("ID").is_in(ids)).to_polars(session)
 ```
+
+### Clés de groupe temporelles avec `dt.truncate()`
+
+- [x] **Traduire les périodes constantes.** `group_by(pl.col("TS").dt.truncate("1d").alias("DAY"))` accepte aussi `"1h"` et `"15m"`. Le SQL utilise `DATE_TRUNC` pour la journée, `DATE_TRUNC` ou `TIME_SLICE` pour les timestamps sans fuseau connus, et soustrait la fraction écoulée de la tranche pour les timestamps zonés ou de type inconnu. Pour `TIMESTAMP_LTZ`, le fuseau de session détermine les bornes locales et l’arithmétique conserve les deux occurrences de l’heure répétée. Une colonne déclarée `DATE` conserve son type et sa valeur pour ces trois périodes. [Snowflake `DATE_TRUNC`](https://docs.snowflake.com/en/sql-reference/functions/date_trunc) · [Snowflake `TIME_SLICE`](https://docs.snowflake.com/en/sql-reference/functions/time_slice) · [Snowflake `DATEADD`](https://docs.snowflake.com/en/sql-reference/functions/dateadd)
+- [x] **Tester les clés de groupe et les composants temporels.** Couvrir la compilation des clés, la conservation du type, `dt.date()` et `dt.minute()`. Le test de parité Snowflake couvre le type et le nom de la clé, les timestamps nuls, les effectifs et les transitions d’heure dans `Europe/Paris`. [Tests hors ligne](tests/test_polars_temporal_membership.py) · [Test Snowflake](tests/test_polars_snowflake.py)
+- [ ] **Étendre les périodes prises en charge.** Vérifier l’origine des tranches et le lundi comme début de semaine avant d’ajouter `"1w"`, puis établir le contrat des durées dynamiques.
+
+### Recherche avec `str.contains()`
+
+- [x] **Traduire la recherche littérale.** `literal=True` accepte un motif constant lié comme paramètre ou un motif calculé par ligne. `POSITION` utilise la collation UTF-8 explicite et garantit la correspondance du motif vide sur toute chaîne non nulle. Les tests couvrent les métacaractères, la casse, les accents, les collations et les `NULL`. [Snowflake `POSITION`](https://docs.snowflake.com/en/sql-reference/functions/position) · [Tests](tests/test_polars_string_contains.py)
+- [x] **Traduire la recherche regex de sous-chaîne.** `REGEXP_INSTR(...) > 0` recherche un motif constant du sous-ensemble commun, avec prise en charge du préfixe `(?i)`. La traduction traite aussi les correspondances de longueur zéro sur un sujet vide. Un motif invalide lève une erreur en mode strict et donne `NULL` en mode non strict. Les motifs regex dynamiques et les constructions hors du sous-ensemble produisent un diagnostic explicite. Les tests couvrent les projections et les filtres. [Snowflake `REGEXP_INSTR`](https://docs.snowflake.com/en/sql-reference/functions/regexp_instr) · [Sémantique Polars de `literal` et `strict`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.str.contains.html) · [Test Snowflake](tests/test_polars_snowflake.py)
+
+### Spread journalier avec `spread_expr`
+
+La compilation de l’expression suivante lève `UnsupportedPolarsExpression` sur le `when` externe. Elle combine des agrégats scalaires par groupe et des moyennes sur des séries filtrées, triées et découpées avec une longueur calculée dans le même groupe.
+
+```python
+import polars as pl
+
+
+def spread_expr(nb_hours: int, period: int | pl.Expr | None = None) -> pl.Expr:
+    if period is None:
+        period_expr = pl.when((pl.col("TS").dt.minute() != 0).any()).then(15).otherwise(60)
+    elif isinstance(period, int):
+        if period <= 0:
+            raise ValueError("Period must be positive")
+        period_expr = pl.lit(period)
+    else:
+        period_expr = period
+
+    n_elem = 60 // period_expr
+    n_elem = pl.when(n_elem.is_in((1, 4))).then(n_elem).otherwise(None)
+    k = (nb_hours * n_elem).floor().cast(pl.Int64)
+
+    sym = pl.col("VALUE").drop_nulls().sort()
+    up = pl.col("VALUE").filter(pl.col("DIRECTION") == "UP").drop_nulls().sort()
+    down = pl.col("VALUE").filter(pl.col("DIRECTION") == "DOWN").drop_nulls().sort()
+
+    sym_spread = pl.when((k > 0) & (sym.count() >= k)).then(sym.tail(k).mean() - sym.head(k).mean()).otherwise(None)
+    k_asym = pl.min_horizontal(k.fill_null(0), up.count(), down.count())
+    asym_spread = pl.when(k_asym > 0).then(up.tail(k_asym).mean() - down.head(k_asym).mean()).otherwise(None)
+    return pl.when(pl.col("DIRECTION").eq("SYMMETRIC").all()).then(sym_spread).otherwise(asym_spread).alias("VALUE")
+```
+
+- [ ] **Valider le chemin générique avec l’expression complète.** Compiler `spread_expr(4)` avec `to_sql()` dans une agrégation groupée et dans `select()` pour un groupe global. Vérifier que le mode et la période sont calculés sur le groupe complet, puis que chaque moyenne utilise ses propres prix candidats et la taille prévue. Vérifier `period=None`, un entier et une expression qui produit une valeur par groupe. [Plan de traduction](#composition-des-expressions-polars)
+- [ ] **Tester le contrat des périodes invalides.** Le calcul fourni valide le quotient `60 // period_expr` et accepte `45` minutes, dont le quotient vaut `1`. Pour `20` minutes, Polars 2.1.0 lève `ComputeError` lorsque `tail(k)` reçoit un décalage nul, même dans une branche conditionnelle. Pour tester le résultat `NULL` prévu par la docstring, utiliser une variante de référence qui vérifie `period_expr.is_in((15, 60))` et passe `k.fill_null(0)` à `head` et `tail` dans la branche symétrique. Garder la condition `k > 0` pour le résultat final.
+
+#### Table et données de test
+
+Le DDL de référence décrit `DB_CH_FC.FC.PRICE`. Pour le test d’intégration, créer `SNOWPARK_RS_PRICE_FIXTURE` dans le schéma de test avec les mêmes colonnes et des données synthétiques. [Syntaxe de création de table Snowflake](https://docs.snowflake.com/en/sql-reference/sql/create-table)
+
+```sql
+CREATE TABLE DB_CH_FC.FC.PRICE (
+    TS TIMESTAMP_LTZ(9) COMMENT 'Prediction timestamp',
+    MARKET VARCHAR(16777216) COMMENT 'Market name, ex: "DA", "MFRR_ENERGY"',
+    VALUE FLOAT COMMENT 'Prediction value',
+    UNIT VARCHAR(16777216) COMMENT 'Unit, ex: "EUR/MWh", "EUR/MW/h"',
+    ZONE VARCHAR(16777216) COMMENT 'Zone, ex: "FR", "PL", "IT_CALA", "DK_1"',
+    FORECAST_PERIOD VARCHAR(16777216) COMMENT 'Forecast report period, ex: "Y2025S2", "Y2026S1"',
+    SCENARIO VARCHAR(16777216) COMMENT 'Scenario, ex: "Central", "Low", "High"',
+    ID_MODEL VARCHAR(16777216) COMMENT 'Id for the model, ex: "XGBRegressor"',
+    VERSION NUMBER(38,0) COMMENT 'Version, ex: 0, 1, 2',
+    ID_INFERENCE_DATASET VARCHAR(16777216) COMMENT 'Id for the inference dataset, ex: "future_covariates_PL_V2"',
+    DIRECTION VARCHAR(16777216) COMMENT 'Direction, ex: "UP", "DOWN", "SYMMETRIC"',
+    UPLOAD_TIMESTAMP TIMESTAMP_LTZ(9) COMMENT 'Entry upload timestamp',
+    ID_FLEX VARCHAR(16777216) COMMENT 'Id for the flexibility, ex: "flex_00", "flex10", "postpone_flex_2y_10"'
+)
+CLUSTER BY (FORECAST_PERIOD, ZONE, MARKET, ID_MODEL, SCENARIO, VERSION);
+```
+
+- [ ] **Comparer les résultats à Polars.** Utiliser les mêmes lignes et `spread_expr` dans les deux moteurs. Grouper par `pl.col("TS").dt.truncate("1d").alias("DAY")`, `MARKET` et `ZONE`, avec les autres dimensions fixes dans la fixture. Comparer les clés, le type flottant de `VALUE`, les `NULL` et les valeurs avec une tolérance adaptée à `FLOAT`. Activer le test via `SNOWPARK_RS_TEST_CONNECTION`. [Tests de parité Snowflake](tests/test_polars_snowflake.py)
+- [ ] **Couvrir les cas métier.** Pour quatre heures, vérifier `k = 4` en horaire et `k = 16` en quart d’heure. Couvrir les périodes fixes, dynamiques et inférées, ainsi que `k = 0`, les timestamps manquants, les prix nuls et les directions nulles. Pour six prix symétriques de `1` à `6` et `k = 4`, attendre `2` malgré le chevauchement des sélections. Pour des prix `UP` de `10`, `14`, `18` et des prix `DOWN` de `2`, `6`, attendre `12` avec deux prix retenus de chaque côté. Vérifier un résultat `NULL` quand le groupe symétrique contient moins de `k` prix valides ou quand une direction manque en mode asymétrique.
+- [ ] **Vérifier les changements d’heure.** Utiliser `Europe/Paris` pour le fuseau de session Snowflake et les timestamps Polars. Tester des jours locaux de 23 et de 25 heures avec une période inférée, en vérifiant les bornes du groupe et la taille `k`, déterminée par la période. [Sémantique de `TIMESTAMP_LTZ`](https://docs.snowflake.com/en/sql-reference/data-types-datetime)
 
 ### Extensions Snowflake
 
@@ -283,7 +367,7 @@ Les jalons suivants recensent les capacités déjà implémentées et les pistes
 
 ### 9. Vocabulaire SQL Snowflake
 
-- [ ] **Projections Snowflake.** Exposer `SELECT * ILIKE`, `EXCLUDE`, `REPLACE` et `RENAME` dans les projections, avec étoile qualifiée. Tester les combinaisons autorisées, l’ordre des modificateurs, les noms cités et la propagation du schéma. [SELECT](https://docs.snowflake.com/en/sql-reference/sql/select)
+- [x] **Projections Snowflake.** En Rust, `select` accepte une étoile qualifiée avec `ILIKE` ou `EXCLUDE`, suivis de `REPLACE` et `RENAME`. Le compilateur résout l’ordre, les noms et les types des sorties lorsque le schéma le permet. Les motifs avec une barre oblique inverse sont résolus par Snowflake. [Tests hors ligne](crates/snowflake-ast/tests/star.rs) · [Test Snowflake](tests/snowflake_smoke.rs) · [SELECT](https://docs.snowflake.com/en/sql-reference/sql/select)
 - [x] **Filtres d’agrégation et de fenêtre.** `having` filtre les groupes et `qualify` filtre les résultats de fenêtre. Les prédicats peuvent référencer les alias de la projection. Les tests couvrent la composition avec `GROUP BY`, les fenêtres, `DISTINCT`, le tri et la limite. [Tests SQL](crates/snowflake-ast/tests/post_filters.rs) · [HAVING](https://docs.snowflake.com/en/sql-reference/constructs/having) · [QUALIFY](https://docs.snowflake.com/en/sql-reference/constructs/qualify)
 - [ ] **Conversions et données semi-structurées.** Prioriser `TRY_CAST`, `TRY_TO_NUMBER`, `TRY_PARSE_JSON`, `TYPEOF`, `GET_PATH`, `ARRAY_CONSTRUCT`, `OBJECT_CONSTRUCT_KEEP_NULL` et `IS_NULL_VALUE`. Vérifier la différence entre `NULL` SQL, `null` JSON et les clés absentes, ainsi que la précision et les erreurs de conversion. [Conversions](https://docs.snowflake.com/en/sql-reference/functions/try_cast) · [Fonctions semi-structurées](https://docs.snowflake.com/en/sql-reference/functions-semistructured)
 - [ ] **Parcours hiérarchiques.** Ajouter `WITH RECURSIVE`, puis `CONNECT BY` avec `START WITH`, `PRIOR` et `LEVEL`. Tester les portées d’alias, les racines multiples, l’ordre des binds et les bornes de parcours. [WITH](https://docs.snowflake.com/en/sql-reference/constructs/with) · [CONNECT BY](https://docs.snowflake.com/en/sql-reference/constructs/connect-by)

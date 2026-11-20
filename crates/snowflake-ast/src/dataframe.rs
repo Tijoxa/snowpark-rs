@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use crate::{
-    Column, CompileError, CompiledQuery, Field, JoinType, Projection, SortKey, compile,
+    Column, CompileError, CompiledQuery, Field, JoinType, Projection, SortKey, Star, compile,
     expr::Expr,
     ident::ObjectName,
     plan::{LogicalPlan, PredicateClause, UnionAlignment},
@@ -132,12 +132,10 @@ impl DataFrame {
         if names.is_empty() {
             return self.clone();
         }
-        Self {
-            plan: Arc::new(LogicalPlan::Rename {
-                input: Arc::clone(&self.plan),
-                names,
-            }),
-        }
+        self.select([Star {
+            renames: names,
+            ..Star::default()
+        }])
     }
 
     /// Remove duplicate rows.
@@ -217,7 +215,7 @@ impl DataFrame {
         }
     }
 
-    /// Select column names, expressions or aliased projections.
+    /// Select column names, expressions, or a qualified star with optional modifiers.
     pub fn select(&self, projections: impl IntoIterator<Item = impl Into<Projection>>) -> Self {
         Self {
             plan: Arc::new(LogicalPlan::Project {

@@ -3,19 +3,22 @@ use std::{
     sync::Arc,
 };
 
-use crate::{BindValue, DataType, plan::LogicalPlan};
+use crate::{BindValue, DataType, Star, plan::LogicalPlan, star};
 
 /// A reference, literal or predicate in a DataFrame expression.
 #[derive(Clone)]
 #[must_use]
 pub struct Column(pub(crate) Expr);
 
-/// An output expression with an optional SQL alias.
+/// An output expression with an optional SQL alias, or a star selection.
 #[derive(Clone)]
 #[must_use]
-pub struct Projection {
-    pub(crate) expr: Expr,
-    pub(crate) alias: Option<String>,
+pub struct Projection(pub(crate) ProjectionKind);
+
+#[derive(Clone)]
+pub(crate) enum ProjectionKind {
+    Expression { expr: Expr, alias: Option<String> },
+    Star(Box<Star>),
 }
 
 /// Reference a column by an unquoted or double-quoted Snowflake identifier.
@@ -68,6 +71,41 @@ pub fn row_number(
 }
 
 impl Column {
+    /// Represent the instant in the specified time zone.
+    pub fn in_time_zone(self, zone: impl Into<String>) -> Self {
+        Self(Expr::InTimeZone(Box::new(self.0), zone.into()))
+    }
+
+    /// Truncate a temporal value to a supported calendar or clock bucket.
+    pub fn truncate_temporal(self, bucket: TemporalBucket) -> Self {
+        Self(Expr::TruncateTemporal(Box::new(self.0), bucket))
+    }
+
+    /// Extract the minute of a timestamp or time.
+    pub fn minute(self) -> Self {
+        Self(Expr::Minute(Box::new(self.0)))
+    }
+
+    /// Search for a literal substring using Snowflake's UTF-8 collation.
+    pub fn contains_text(self, pattern: Self) -> Self {
+        Self(Expr::ContainsText(Box::new(self.0), Box::new(pattern.0)))
+    }
+
+    /// Search for a substring matching a Snowflake regular expression.
+    pub fn contains_regex(
+        self,
+        pattern: String,
+        case_insensitive: bool,
+        matches_empty: bool,
+    ) -> Self {
+        Self(Expr::ContainsRegex {
+            subject: Box::new(self.0),
+            pattern,
+            case_insensitive,
+            matches_empty,
+        })
+    }
+
     /// Compute a COUNT or SUM over every row in the specified partition.
     pub fn over(self, partition_by: impl IntoIterator<Item = Column>) -> Self {
         Self(Expr::Over {
@@ -123,10 +161,10 @@ impl Column {
     }
 
     pub fn alias(self, name: impl Into<String>) -> Projection {
-        Projection {
+        Projection(ProjectionKind::Expression {
             expr: self.0,
             alias: Some(name.into()),
-        }
+        })
     }
 
     pub fn eq(self, other: Self) -> Self {
@@ -287,22 +325,36 @@ impl<T: Into<Column>> From<T> for SortKey {
 
 impl From<Column> for Projection {
     fn from(column: Column) -> Self {
-        Self {
+        Self(ProjectionKind::Expression {
             expr: column.0,
             alias: None,
-        }
+        })
     }
 }
 
 impl From<&str> for Projection {
     fn from(name: &str) -> Self {
-        col(name).into()
+        if name == "*" {
+            star().into()
+        } else {
+            col(name).into()
+        }
     }
 }
 
 impl From<String> for Projection {
     fn from(name: String) -> Self {
-        col(name).into()
+        if name == "*" {
+            star().into()
+        } else {
+            col(name).into()
+        }
+    }
+}
+
+impl From<Star> for Projection {
+    fn from(star: Star) -> Self {
+        Self(ProjectionKind::Star(Box::new(star)))
     }
 }
 
@@ -324,6 +376,16 @@ pub(crate) enum Expr {
     TimestampFromEpoch(i64, TimestampUnit, bool),
     TemporalEpoch(Box<Self>, Option<DataType>),
     UtcDate(Box<Self>),
+    InTimeZone(Box<Self>, String),
+    TruncateTemporal(Box<Self>, TemporalBucket),
+    Minute(Box<Self>),
+    ContainsText(Box<Self>, Box<Self>),
+    ContainsRegex {
+        subject: Box<Self>,
+        pattern: String,
+        case_insensitive: bool,
+        matches_empty: bool,
+    },
     InList {
         expr: Box<Self>,
         values: Vec<Self>,
@@ -357,12 +419,17 @@ impl Expr {
             }
             Self::Binary(left, _, right)
             | Self::Power(left, right)
-            | Self::Coalesce(left, right) => {
+            | Self::Coalesce(left, right)
+            | Self::ContainsText(left, right) => {
                 left.contains_aggregate() || right.contains_aggregate()
             }
             Self::Cast(inner, _)
             | Self::TemporalEpoch(inner, _)
             | Self::UtcDate(inner)
+            | Self::InTimeZone(inner, _)
+            | Self::TruncateTemporal(inner, _)
+            | Self::Minute(inner)
+            | Self::ContainsRegex { subject: inner, .. }
             | Self::InQuery(inner, _)
             | Self::TryParseJson(inner)
             | Self::Negate(inner)
@@ -386,12 +453,17 @@ impl Expr {
             }
             Self::Binary(left, _, right)
             | Self::Power(left, right)
-            | Self::Coalesce(left, right) => {
+            | Self::Coalesce(left, right)
+            | Self::ContainsText(left, right) => {
                 left.contains_ungrouped_reference() || right.contains_ungrouped_reference()
             }
             Self::Cast(inner, _)
             | Self::TemporalEpoch(inner, _)
             | Self::UtcDate(inner)
+            | Self::InTimeZone(inner, _)
+            | Self::TruncateTemporal(inner, _)
+            | Self::Minute(inner)
+            | Self::ContainsRegex { subject: inner, .. }
             | Self::InQuery(inner, _)
             | Self::TryParseJson(inner)
             | Self::Negate(inner)
@@ -400,6 +472,14 @@ impl Expr {
             | Self::IsNotNull(inner) => inner.contains_ungrouped_reference(),
         }
     }
+}
+
+/// Calendar and clock buckets for temporal truncation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporalBucket {
+    Day,
+    Hour,
+    QuarterHour,
 }
 
 #[derive(Clone, Copy)]

@@ -143,7 +143,7 @@ impl DataFrame {
         }
     }
 
-    /// Select column names, expressions or aliased projections.
+    /// Select column names, expressions, or a qualified star with optional modifiers.
     pub fn select(&self, projections: impl IntoIterator<Item = impl Into<Projection>>) -> Self {
         Self {
             plan: self.plan.select(projections),

@@ -8,6 +8,73 @@ from snowpark_rs import Field, Table, UnsupportedPolarsExpression
 CUTOFF = date(2024, 1, 1)
 
 
+@pytest.mark.parametrize(
+    ("every", "bucket_sql"),
+    [
+        ("1d", 'DATE_TRUNC(DAY, t0."TS")'),
+        ("1h", 'DATE_TRUNC(HOUR, t0."TS")'),
+        ("15m", "TIME_SLICE(t0.\"TS\", 15, 'MINUTE')"),
+    ],
+)
+def test_truncate_is_a_typed_group_key(every, bucket_sql):
+    table = Table("T", schema=[Field("TS", "TIMESTAMP_NTZ", nullable=True)])
+    query = table.group_by(pl.col("TS").dt.truncate(every).alias("BUCKET")).agg(
+        pl.len()
+    )
+    sql, binds = query.to_sql()
+    assert sql.startswith(f'SELECT {bucket_sql} AS "BUCKET", COUNT(*)')
+    assert sql.endswith("GROUP BY 1")
+    assert binds == []
+    assert query.schema is not None
+    field = query.schema[0]
+    assert (field.name, field.data_type, field.nullable) == (
+        "BUCKET",
+        "TIMESTAMP_NTZ",
+        True,
+    )
+
+
+def test_subday_truncate_compiles_without_a_declared_schema():
+    bucket = pl.col("TS").dt.truncate("15m").alias("BUCKET")
+    sql, binds = Table("T").group_by(bucket).agg(pl.len()).to_sql()
+    assert sql.startswith(
+        'SELECT DATEADD(NANOSECOND, -(MOD(DATE_PART(MINUTE, t0."TS"), 15)'
+    )
+    assert sql.endswith("GROUP BY 1")
+    assert binds == []
+
+
+def test_temporal_components_and_date_truncation_keep_their_types():
+    table = Table("T", schema=[Field("TS", "TIMESTAMP_LTZ"), Field("D", "DATE")])
+    query = table.select(
+        day=pl.col("TS").dt.date(),
+        minute=pl.col("TS").dt.minute(),
+        bucket=pl.col("D").dt.truncate("1h"),
+    )
+    sql, binds = query.to_sql()
+    assert 'CAST(t0."TS" AS DATE) AS "day"' in sql
+    assert 'CAST(DATE_PART(MINUTE, t0."TS") AS NUMBER(2, 0)) AS "minute"' in sql
+    assert 't0."D" AS "bucket"' in sql
+    assert binds == []
+    assert query.schema is not None
+    assert [field.data_type for field in query.schema] == [
+        "DATE",
+        "NUMBER(2,0)",
+        "DATE",
+    ]
+    with pytest.raises(UnsupportedPolarsExpression, match="a time or timestamp"):
+        table.select(pl.col("D").dt.minute()).to_sql()
+
+
+@pytest.mark.parametrize("every", ["1w", pl.col("EVERY")])
+def test_truncate_reports_unsupported_periods(every):
+    query = Table("T").group_by(pl.col("TS").dt.truncate(every)).agg(pl.len())
+    with pytest.raises(
+        UnsupportedPolarsExpression, match=r"group_by: .*Truncate: .*constant duration"
+    ):
+        query.to_sql()
+
+
 def test_polars_and_python_dates_compile_to_the_same_filter_without_a_schema():
     source = Table("PUBLIC.PUBLIC.EXAMPLE")
     column = pl.col("CREATED_AT")

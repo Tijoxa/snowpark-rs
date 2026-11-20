@@ -1,8 +1,11 @@
+mod star;
+
 use std::{cell::Cell, collections::HashSet, sync::Arc};
 
 use crate::{
-    BindValue, CompiledQuery, DataType, Field, JoinType, Projection, SortKey, col,
-    expr::{Aggregate, BinaryOp, Expr},
+    BindValue, Column, CompiledQuery, DataType, Field, JoinType, Projection, SortKey,
+    TemporalBucket, col,
+    expr::{Aggregate, BinaryOp, Expr, ProjectionKind},
     ident::Ident,
     plan::{LogicalPlan, PredicateClause, UnionAlignment},
 };
@@ -22,6 +25,10 @@ pub enum CompileError {
     InvalidTableName,
     #[error("select requires at least one projection")]
     EmptyProjection,
+    #[error("a star selection is only valid in a row projection")]
+    UnexpectedStar,
+    #[error("a star selection cannot combine ILIKE with EXCLUDE")]
+    IncompatibleStarFilters,
     #[error("column {0:?} is not exported by the input projection")]
     UnknownColumn(String),
     #[error("column {0:?} is ambiguous in the input projection")]
@@ -222,7 +229,6 @@ impl Compiler {
                 expr,
                 keep_column_order,
             } => self.with_column(input, name, expr, *keep_column_order),
-            LogicalPlan::Rename { input, names } => self.rename(input, names),
             LogicalPlan::Distinct { input } => {
                 let mut block = self.block(input)?;
                 block.check_intermediate_order()?;
@@ -341,10 +347,7 @@ impl Compiler {
             .into_iter()
             .map(|name| col(name.to_string()).into())
             .collect();
-        let column = Projection {
-            expr: expr.clone(),
-            alias: Some(name.to_string()),
-        };
+        let column = Column(expr.clone()).alias(name.to_string());
         match original {
             Some(index) if keep_column_order => projections[index] = column,
             Some(index) => {
@@ -354,55 +357,6 @@ impl Compiler {
             None => projections.push(column),
         }
         block.project(input, &projections, &[], true)?;
-        Ok(block)
-    }
-
-    fn rename(
-        &mut self,
-        input: &LogicalPlan,
-        names: &[(Expr, String)],
-    ) -> Result<Block, CompileError> {
-        let mut block = self.projection_input(input)?;
-        let scope = block.scope(input);
-        let mut renames = Vec::with_capacity(names.len());
-        for (expr, name) in names {
-            let Expr::Reference {
-                name: old,
-                relation,
-            } = expr
-            else {
-                return Err(CompileError::ExpectedReference);
-            };
-            let (_, old) = scope.reference(old, relation.as_deref())?;
-            if renames.iter().any(|(source, _)| *source == old) {
-                return Err(CompileError::AmbiguousColumn(old.to_string()));
-            }
-            renames.push((old, Ident::parse(name)?));
-        }
-        let mut columns = block.columns.take();
-        if let Some(columns) = &mut columns {
-            let mut outputs = HashSet::with_capacity(columns.len());
-            for name in columns.iter_mut().filter_map(|output| output.name.as_mut()) {
-                if let Some((_, renamed)) = renames.iter().find(|(old, _)| old == name) {
-                    *name = renamed.clone();
-                }
-                if !outputs.insert(&*name) {
-                    return Err(CompileError::DuplicateOutput(name.to_string()));
-                }
-            }
-        }
-        let renamed = renames
-            .iter()
-            .map(|(old, name)| format!("{old} AS {name}"))
-            .collect::<Vec<_>>();
-        block.projection = Some(Projected {
-            sql: CompiledQuery {
-                sql: format!("t{}.* RENAME ({})", block.alias, renamed.join(", ")),
-                binds: Vec::new(),
-            },
-            columns,
-            ..Projected::default()
-        });
         Ok(block)
     }
 
@@ -814,6 +768,8 @@ impl Scope<'_> {
                 Expr::Binary(..)
                     | Expr::InList { .. }
                     | Expr::InQuery(..)
+                    | Expr::ContainsText(..)
+                    | Expr::ContainsRegex { .. }
                     | Expr::Negate(_)
                     | Expr::Not(_)
                     | Expr::IsNull(_)
@@ -867,6 +823,49 @@ impl Scope<'_> {
                 query.sql.push_str("CAST(CONVERT_TIMEZONE('UTC', ");
                 self.emit_expression(inner, query, false, allow_aggregate)?;
                 query.sql.push_str(") AS DATE)");
+            }
+            Expr::InTimeZone(inner, zone) => {
+                query.sql.push_str("CONVERT_TIMEZONE(?, ");
+                query.binds.push(BindValue::Text(zone.clone()));
+                self.emit_expression(inner, query, false, allow_aggregate)?;
+                query.sql.push(')');
+            }
+            Expr::TruncateTemporal(inner, bucket) => {
+                self.emit_temporal_truncate(inner, *bucket, query, allow_aggregate)?;
+            }
+            Expr::Minute(inner) => {
+                query.sql.push_str("CAST(DATE_PART(MINUTE, ");
+                self.emit_expression(inner, query, false, allow_aggregate)?;
+                query.sql.push_str(") AS NUMBER(2, 0))");
+            }
+            Expr::ContainsText(subject, pattern) => {
+                // POSITION specifies that an empty pattern matches, even on an empty subject.
+                query.sql.push_str("POSITION(COLLATE(");
+                self.emit_expression(pattern, query, false, allow_aggregate)?;
+                query.sql.push_str(", 'utf8'), COLLATE(");
+                self.emit_expression(subject, query, false, allow_aggregate)?;
+                query.sql.push_str(", 'utf8')) > 0");
+            }
+            Expr::ContainsRegex {
+                subject,
+                pattern,
+                case_insensitive,
+                matches_empty,
+            } => {
+                query.sql.push_str("REGEXP_INSTR(COLLATE(");
+                self.emit_expression(subject, query, false, allow_aggregate)?;
+                query.sql.push_str(", ''), ?");
+                query.binds.push(BindValue::Text(pattern.clone()));
+                if *case_insensitive {
+                    query.sql.push_str(", 1, 1, 0, 'i'");
+                }
+                query.sql.push_str(") > 0");
+                if *matches_empty {
+                    // REGEXP_INSTR starts at position 1, which is past an empty subject.
+                    query.sql.push_str(" OR OCTET_LENGTH(");
+                    self.emit_expression(subject, query, false, allow_aggregate)?;
+                    query.sql.push_str(") = 0");
+                }
             }
             Expr::InList {
                 expr,
@@ -1087,6 +1086,70 @@ impl Scope<'_> {
         Ok(())
     }
 
+    fn emit_temporal_truncate(
+        &self,
+        expr: &Expr,
+        bucket: TemporalBucket,
+        query: &mut CompiledQuery,
+        allow_aggregate: bool,
+    ) -> Result<(), CompileError> {
+        let data_type = self.expression_type(expr)?.0;
+        let emit_input =
+            |query: &mut CompiledQuery| self.emit_expression(expr, query, false, allow_aggregate);
+        if bucket == TemporalBucket::Day
+            && let Expr::InTimeZone(_, zone) = expr
+        {
+            // The offset at local midnight can differ from the input's offset.
+            query.sql.push_str(concat!(
+                "CONVERT_TIMEZONE(?, TO_TIMESTAMP_TZ(DATE_PART(EPOCH_NANOSECOND, ",
+                "CONVERT_TIMEZONE(?, 'UTC', DATE_TRUNC(DAY, CAST("
+            ));
+            query
+                .binds
+                .extend([BindValue::Text(zone.clone()), BindValue::Text(zone.clone())]);
+            emit_input(query)?;
+            query.sql.push_str(" AS TIMESTAMP_NTZ)))), 9))");
+            return Ok(());
+        }
+        let (prefix, suffix) = match (bucket, data_type) {
+            (_, Some(DataType::Date)) => return emit_input(query),
+            (TemporalBucket::Day, _) => ("DATE_TRUNC(DAY, ", ")"),
+            (TemporalBucket::Hour, Some(DataType::TimestampNtz)) => ("DATE_TRUNC(HOUR, ", ")"),
+            (TemporalBucket::QuarterHour, Some(DataType::TimestampNtz)) => {
+                ("TIME_SLICE(", ", 15, 'MINUTE')")
+            }
+            // Subtract the elapsed portion of the local bucket from the original instant.
+            // This keeps the two occurrences of a repeated local hour separate.
+            (bucket, _) => {
+                let minutes = if bucket == TemporalBucket::Hour {
+                    60
+                } else {
+                    15
+                };
+                query
+                    .sql
+                    .push_str("DATEADD(NANOSECOND, -(MOD(DATE_PART(MINUTE, ");
+                emit_input(query)?;
+                query
+                    .sql
+                    .push_str(&format!("), {minutes}) * 60000000000 + DATE_PART(SECOND, "));
+                emit_input(query)?;
+                query
+                    .sql
+                    .push_str(") * 1000000000 + DATE_PART(NANOSECOND, ");
+                emit_input(query)?;
+                query.sql.push_str(")), ");
+                emit_input(query)?;
+                query.sql.push(')');
+                return Ok(());
+            }
+        };
+        query.sql.push_str(prefix);
+        emit_input(query)?;
+        query.sql.push_str(suffix);
+        Ok(())
+    }
+
     fn emit_in_list(
         &self,
         expr: &Expr,
@@ -1179,6 +1242,27 @@ impl Scope<'_> {
                 self.expression_type(inner)?.1,
             ),
             Expr::UtcDate(inner) => (Some(DataType::Date), self.expression_type(inner)?.1),
+            Expr::InTimeZone(inner, _) => {
+                (Some(DataType::TimestampTz), self.expression_type(inner)?.1)
+            }
+            Expr::TruncateTemporal(inner, _) => self.expression_type(inner)?,
+            Expr::Minute(inner) => (
+                Some(DataType::Number {
+                    precision: 2,
+                    scale: 0,
+                }),
+                self.expression_type(inner)?.1,
+            ),
+            Expr::ContainsText(subject, pattern) => (
+                Some(DataType::Boolean),
+                nullable_either(
+                    self.expression_type(subject)?.1,
+                    self.expression_type(pattern)?.1,
+                ),
+            ),
+            Expr::ContainsRegex { subject, .. } => {
+                (Some(DataType::Boolean), self.expression_type(subject)?.1)
+            }
             Expr::InList {
                 expr, nulls_equal, ..
             } => (
@@ -1254,27 +1338,38 @@ impl Scope<'_> {
         &self,
         keys: &[Projection],
         aggregates: &[Projection],
-        allow_window: bool,
+        row_projection: bool,
     ) -> Result<Projected, CompileError> {
-        let mut result = Projected::default();
         let has_window = Cell::new(false);
         let scope = Scope {
-            has_window: allow_window.then_some(&has_window),
+            has_window: row_projection.then_some(&has_window),
             ..*self
         };
-        let mut columns = Vec::new();
+        let mut result = Projected {
+            columns: Some(Vec::new()),
+            ..Projected::default()
+        };
         let projections = keys
             .iter()
             .map(|projection| (projection, false))
             .chain(aggregates.iter().map(|projection| (projection, true)));
-        if aggregates
+        if !row_projection
+            && projections
+                .clone()
+                .any(|(projection, _)| matches!(projection.0, ProjectionKind::Star(_)))
+        {
+            return Err(CompileError::UnexpectedStar);
+        }
+        let mut expressions = aggregates
             .iter()
-            .any(|projection| projection.expr.contains_ungrouped_reference())
+            .filter_map(|projection| match &projection.0 {
+                ProjectionKind::Expression { expr, .. } => Some(expr),
+                ProjectionKind::Star(_) => None,
+            });
+        if expressions.clone().any(Expr::contains_ungrouped_reference)
             || (keys.is_empty()
                 && !aggregates.is_empty()
-                && !aggregates
-                    .iter()
-                    .any(|projection| projection.expr.contains_aggregate()))
+                && !expressions.any(Expr::contains_aggregate))
         {
             return Err(CompileError::ExpectedAggregate);
         }
@@ -1282,34 +1377,54 @@ impl Scope<'_> {
             if index > 0 {
                 result.sql.sql.push_str(", ");
             }
-            let mut expression = CompiledQuery::default();
-            scope.emit_expression(&projection.expr, &mut expression, false, aggregate)?;
-            let name = if let Some(alias) = &projection.alias {
-                let alias = Ident::parse(alias)?;
-                result.sql.append(expression.clone());
-                result.sql.sql.push_str(&format!(" AS {alias}"));
-                result.aliases.push(SelectAlias {
-                    name: alias.clone(),
-                    expression,
-                    group_key: !aggregate && !aggregates.is_empty(),
-                });
-                Some(alias)
-            } else {
-                result.sql.append(expression);
-                if let Expr::Reference { name, .. } = &projection.expr {
-                    Some(Ident::parse(name)?)
-                } else {
-                    None
+            match &projection.0 {
+                ProjectionKind::Expression { expr, alias } => {
+                    let mut expression = CompiledQuery::default();
+                    scope.emit_expression(expr, &mut expression, false, aggregate)?;
+                    let name = if let Some(alias) = alias {
+                        let alias = Ident::parse(alias)?;
+                        result.sql.append(expression.clone());
+                        result.sql.sql.push_str(&format!(" AS {alias}"));
+                        result.aliases.push(SelectAlias {
+                            name: alias.clone(),
+                            expression,
+                            group_key: !aggregate && !aggregates.is_empty(),
+                        });
+                        Some(alias)
+                    } else {
+                        result.sql.append(expression);
+                        if let Expr::Reference { name, .. } = expr {
+                            Some(Ident::parse(name)?)
+                        } else {
+                            None
+                        }
+                    };
+                    let (data_type, nullable) = self.expression_type(expr)?;
+                    if let Some(columns) = &mut result.columns {
+                        columns.push(Output {
+                            name,
+                            data_type,
+                            nullable,
+                        });
+                    }
                 }
-            };
-            let (data_type, nullable) = self.expression_type(&projection.expr)?;
-            columns.push(Output {
-                name,
-                data_type,
-                nullable,
-            });
+                ProjectionKind::Star(star) => {
+                    let outputs = self.project_star(star, &mut result.sql)?;
+                    result.columns =
+                        result
+                            .columns
+                            .take()
+                            .zip(outputs)
+                            .map(|(mut columns, outputs)| {
+                                columns.extend(outputs);
+                                columns
+                            });
+                }
+            }
         }
-        result.columns = Some(columns);
+        if result.columns.as_ref().is_some_and(Vec::is_empty) {
+            return Err(CompileError::EmptyProjection);
+        }
         result.has_window = has_window.get();
         Ok(result)
     }

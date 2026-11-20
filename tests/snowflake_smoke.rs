@@ -3,8 +3,8 @@ use std::{error::Error, time::Duration};
 use arrow_array::{BooleanArray, Decimal128Array, StringArray};
 use futures_util::TryStreamExt;
 use snowpark_rs::{
-    DataFrame, Decimal, JoinType, Session, col, count, count_all, lit, lit_null, row_number,
-    session::connect_profile, sum,
+    DataFrame, Decimal, JoinType, Projection, Session, col, count, count_all, lit, lit_null,
+    row_number, session::connect_profile, star, sum,
 };
 
 #[test]
@@ -41,6 +41,46 @@ fn snowflake_dataframe_uses_the_explicit_session() -> Result<(), Box<dyn Error>>
             let rows = frame.to_arrow(session).await?;
             assert_eq!(decimals(&rows, 0).iter().collect::<Vec<_>>(), [Some(id)]);
         }
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires a named Snowflake profile and the PUBLIC.PUBLIC.EXAMPLE fixture"]
+fn snowflake_selects_star_with_modifiers() -> Result<(), Box<dyn Error>> {
+    with_session(async |session| {
+        let input = DataFrame::table_name("PUBLIC.PUBLIC.EXAMPLE")?
+            .filter(col("id").eq(lit(1)))
+            .select([
+                col("id").alias(r#""Refé'?\A""#),
+                col("name").into(),
+                col("category").into(),
+            ]);
+        let replaced = input.select([star()
+            .exclude(["category"])
+            .replace("name", lit("replacement"))]);
+        let projected = replaced.select([
+            star()
+                .ilike(r"ref_'?\\A")
+                .replace(r#""Refé'?\A""#, lit(42))
+                .rename(r#""Refé'?\A""#, r#""result id""#)
+                .into(),
+            Projection::from("name"),
+        ]);
+
+        let rows = projected.to_arrow(&session).await?;
+        assert_eq!(rows.schema().field(0).name(), "result id");
+        assert_eq!(decimals(&rows, 0).iter().collect::<Vec<_>>(), [Some(42)]);
+        let names = rows
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.iter().collect::<Vec<_>>(), [Some("replacement")]);
+
+        let empty = projected.limit(0).to_arrow(&session).await?;
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(empty.schema(), rows.schema());
         Ok(())
     })
 }

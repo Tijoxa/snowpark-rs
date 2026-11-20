@@ -1,3 +1,5 @@
+mod regex;
+
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -9,11 +11,11 @@ use polars_core::{
 use polars_plan::{
     dsl::{
         AggExpr, BooleanFunction, DataTypeExpr, Expr, FunctionExpr, Operator, PowFunction,
-        Selector, TemporalFunction, WindowMapping,
+        Selector, StringFunction, TemporalFunction, WindowMapping,
     },
     prelude::{DynLiteralValue, LiteralValue},
 };
-use snowflake_ast::TimestampUnit;
+use snowflake_ast::{TemporalBucket, TimestampUnit};
 
 use super::{AstFrame, Context, Result, unsupported};
 use crate::{
@@ -25,6 +27,7 @@ pub(super) const BROADCAST: &str = "broadcasting a reduction over input rows is 
 pub(super) const DECLARE_SCHEMA: &str = "declare the source schema or select named columns first";
 const NO_TRANSLATION: &str = "no translation to Snowflake SQL";
 const ROW_COUNT: DataType = number(10, 0);
+const MINUTE_TYPE: DataType = number(2, 0);
 const SUBQUERY_PREFIX: &str = "snowpark_rs:membership:";
 
 type SchemaColumns = Vec<(String, Option<DataType>)>;
@@ -95,6 +98,13 @@ impl Value {
         );
         result.zone = zone;
         result
+    }
+
+    fn in_expression_time_zone(mut self) -> Self {
+        if let Some(zone) = &self.zone {
+            self.column = self.column.in_time_zone(zone.to_string());
+        }
+        self
     }
 }
 
@@ -645,6 +655,40 @@ impl<'a> Translator<'a> {
                 }),
                 args,
             ) => self.datetime_parts(args, *time_unit, time_zone.as_ref()),
+            (FunctionExpr::TemporalExpr(TemporalFunction::Truncate), [expr, every]) => {
+                self.truncate(expr, every)
+            }
+            (FunctionExpr::TemporalExpr(TemporalFunction::Date), [expr]) => {
+                let node = "Function.TemporalExpr.Date";
+                let inner = self.visit(expr, false)?.in_expression_time_zone();
+                if inner.untyped_null || inner.dtype.is_some() && !is_temporal(inner.dtype) {
+                    return Err(self.error(node, "a date or timestamp is required"));
+                }
+                Ok(Value::new(
+                    inner.column.cast(DataType::Date),
+                    inner.shape,
+                    Some(DataType::Date),
+                ))
+            }
+            (FunctionExpr::TemporalExpr(TemporalFunction::Minute), [expr]) => {
+                let node = "Function.TemporalExpr.Minute";
+                let inner = self.visit(expr, false)?.in_expression_time_zone();
+                if inner.untyped_null
+                    || inner.dtype.is_some_and(|dtype| dtype != DataType::Time)
+                        && !is_timestamp(inner.dtype)
+                {
+                    return Err(self.error(node, "a time or timestamp is required"));
+                }
+                Ok(Value::new(
+                    inner.column.minute(),
+                    inner.shape,
+                    Some(MINUTE_TYPE),
+                ))
+            }
+            (
+                FunctionExpr::StringExpr(StringFunction::Contains { literal, strict }),
+                [expr, pattern],
+            ) => self.string_contains(expr, pattern, *literal, *strict),
             (
                 FunctionExpr::FfiPlugin {
                     lib,
@@ -679,6 +723,69 @@ impl<'a> Translator<'a> {
                 Err(self.error(format!("Function.{}", &kind[..end]), NO_TRANSLATION))
             }
         }
+    }
+
+    fn truncate(&self, expr: &Expr, every: &Expr) -> Result<Value> {
+        let node = "Function.TemporalExpr.Truncate";
+        let bucket = match string_literal(every) {
+            Some("1d") => TemporalBucket::Day,
+            Some("1h") => TemporalBucket::Hour,
+            Some("15m") => TemporalBucket::QuarterHour,
+            _ => return Err(self.error(node, "expected a constant duration of 1d, 1h, or 15m")),
+        };
+        let mut inner = self.visit(expr, false)?;
+        if inner.untyped_null || inner.dtype.is_some() && !is_temporal(inner.dtype) {
+            return Err(self.error(node, "a date or timestamp is required"));
+        }
+        inner = inner.in_expression_time_zone();
+        inner.column = inner.column.truncate_temporal(bucket);
+        Ok(inner)
+    }
+
+    fn string_contains(
+        &self,
+        expr: &Expr,
+        pattern: &Expr,
+        literal: bool,
+        strict: bool,
+    ) -> Result<Value> {
+        let node = "Function.StringExpr.Contains";
+        let subject = self.visit(expr, false)?;
+        let translated = self.visit(pattern, false)?;
+        if [&subject, &translated]
+            .iter()
+            .any(|value| value.dtype.is_some_and(|dtype| dtype != DataType::Varchar))
+        {
+            return Err(self.error(node, "the subject and pattern must be strings"));
+        }
+        let shape = self.combine_shape(node, subject.shape, translated.shape)?;
+        let column = if literal {
+            subject.column.contains_text(translated.column)
+        } else if matches!(unalias(pattern), Expr::Literal(LiteralValue::Scalar(value)) if value.value().is_null())
+        {
+            lit_null(DataType::Boolean)
+        } else {
+            let pattern = string_literal(pattern).ok_or_else(|| {
+                self.error(node, "regex patterns must be constant strings; use literal=True for a pattern column")
+            })?;
+            match regex::snowflake_pattern(pattern) {
+                Ok(("", _, _)) => subject.column.contains_text(lit("")),
+                Ok((pattern, case_insensitive, matches_empty)) => subject.column.contains_regex(
+                    pattern.to_owned(),
+                    case_insensitive,
+                    matches_empty,
+                ),
+                Err(regex::PatternError::Invalid) if !strict => lit_null(DataType::Boolean),
+                Err(regex::PatternError::Invalid) => {
+                    return Err(self.error(node, "invalid regex pattern"));
+                }
+                Err(regex::PatternError::Unsupported) => return Err(self.error(
+                    node,
+                    "regex pattern uses syntax outside the supported Snowflake-compatible subset",
+                )),
+            }
+        };
+        Ok(Value::new(column, shape, Some(DataType::Boolean)))
     }
 
     fn datetime_parts(
@@ -931,6 +1038,18 @@ fn unalias(mut expr: &Expr) -> &Expr {
         expr = inner;
     }
     expr
+}
+
+fn string_literal(expr: &Expr) -> Option<&str> {
+    match unalias(expr) {
+        Expr::Literal(LiteralValue::Dyn(DynLiteralValue::Str(value))) => Some(value.as_str()),
+        Expr::Literal(LiteralValue::Scalar(value)) => match value.value() {
+            AnyValue::String(value) => Some(value),
+            AnyValue::StringOwned(value) => Some(value.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn output_name(expr: &Expr) -> &str {

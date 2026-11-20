@@ -65,6 +65,16 @@ True division requires a nonzero literal divisor. The supported Polars windows
 are `sum()`, `count()` and `pl.len()` over whole partitions with the default
 `groups_to_rows` mapping. Rust also exposes `row_number(partition_by, order_by)`.
 
+Temporal group keys accept `pl.col("TS").dt.truncate("1d")`, `"1h"` and
+`"15m"`. The compiler also supports `dt.date()` and `dt.minute()`.
+`TIMESTAMP_LTZ` operations use the Snowflake session time zone. Declare a
+`DATE` column in the table schema to retain its type for sub-day truncation.
+
+`str.contains(..., literal=True)` accepts a string or an expression for the
+pattern and matches using UTF-8 collation. Regex mode accepts constant patterns
+in a subset shared with Snowflake, including alternation, anchors, and a
+leading `(?i)` flag. Invalid regex patterns produce `NULL` with `strict=False`.
+
 Call `having` on an aggregation to filter groups by keys, aggregates, or
 their aliases. Call `qualify` with a window function in the current projection
 or in the predicate. Apply `distinct`, `sort` and `limit` after these clauses
@@ -199,6 +209,27 @@ let compiled = query.to_sql()?;
 
 `with_columns_polars`, `group_by_polars().agg()`, `agg_polars` and
 `sort_polars` also accept typed expressions. Polars column names preserve case.
+
+## Snowflake star projections in Rust
+
+Use `star()` in `select` to apply Snowflake modifiers to the current DataFrame.
+For example, this preserves column order while excluding one column and replacing
+and renaming another.
+
+```rust
+use snowpark_rs::{DataFrame, col, lit, star};
+
+let query = DataFrame::table_name("DB.PUBLIC.SALES")?
+    .select([star()
+        .exclude(["INTERNAL_NOTE"])
+        .replace("AMOUNT", col("AMOUNT") * lit(2))
+        .rename("AMOUNT", "DOUBLE_AMOUNT")])
+    .to_sql()?;
+```
+
+Use `.ilike("%AMOUNT%")` in place of `.exclude(...)` to filter by name.
+When the input names are unknown or the pattern contains a backslash, use
+`schema_with_session` to get the schema from Snowflake.
 
 ## Rust tests
 

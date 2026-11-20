@@ -91,10 +91,6 @@ pub(crate) enum LogicalPlan {
         expr: Expr,
         keep_column_order: bool,
     },
-    Rename {
-        input: Arc<Self>,
-        names: Vec<(Expr, String)>,
-    },
     Distinct {
         input: Arc<Self>,
     },
