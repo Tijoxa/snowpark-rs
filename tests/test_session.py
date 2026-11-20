@@ -3,9 +3,9 @@ from decimal import Decimal
 from types import ModuleType
 from unittest.mock import Mock
 
-import polars as pl
 import pytest
 
+import polars as pl
 import snowpark_rs
 from snowpark_rs import Table, UnsupportedPolarsExpression, _session
 
@@ -83,18 +83,54 @@ def test_offline_api_does_not_import_the_optional_backend(monkeypatch):
         _ = snowpark_rs.Session
 
 
-def test_unsupported_polars_expression_fails_before_using_the_session(open_session):
+@pytest.mark.parametrize(
+    ("frame", "error_type", "diagnostic"),
+    [
+        (
+            Table("T").filter(pl.col("X").rolling_sum(2) > 10),
+            UnsupportedPolarsExpression,
+            "filter: Function.RollingExpr",
+        ),
+        (
+            Table("T").select("X").filter(pl.col("Y") == 1),
+            UnsupportedPolarsExpression,
+            "filter: Column.*absent",
+        ),
+        (
+            Table("T").select(pl.col("X").alias("x" * 256)),
+            ValueError,
+            "invalid Snowflake identifier",
+        ),
+        (
+            Table("T").sort("X").select("X"),
+            ValueError,
+            "intermediate sort",
+        ),
+        (
+            Table("T").select("X").union_by_name(Table("U").select("Y")),
+            ValueError,
+            "different column names",
+        ),
+    ],
+    ids=["unsupported", "missing-column", "invalid-alias", "intermediate-sort", "union-names"],
+)
+def test_compilation_errors_fail_before_using_the_session(
+    open_session, frame, error_type, diagnostic
+):
     session, connection = open_session()
-    frame = Table("T").filter(pl.col("X").rolling_sum(2) > 10)
-
-    with pytest.raises(
-        UnsupportedPolarsExpression, match="filter: Function.RollingExpr"
+    with pytest.raises(error_type, match=diagnostic) as offline:
+        frame.to_sql()
+    for action in (
+        frame.to_arrow,
+        frame.to_arrow_batches,
+        frame.schema_with_session,
+        frame.to_polars,
+        lambda session: frame.to_polars(session, use_batches=True),
     ):
-        frame.to_polars(session)
-    with pytest.raises(
-        UnsupportedPolarsExpression, match="filter: Function.RollingExpr"
-    ):
-        frame.to_polars(session, use_batches=True)
+        with pytest.raises(error_type) as raised:
+            action(session)
+        assert type(raised.value) is type(offline.value)
+        assert str(raised.value) == str(offline.value)
     connection.to_arrow.assert_not_called()
     connection.to_arrow_batches.assert_not_called()
 
@@ -193,6 +229,47 @@ def test_to_arrow_batches_propagates_errors_during_iteration(
         next(batches)
     assert raised.value is error
     assert list(batches) == []
+
+
+def test_submission_errors_reach_every_action_unchanged(frame, open_session):
+    session, connection = open_session()
+    error = RuntimeError(
+        'Snowflake query submission failed (Server, code Some("000904"), '
+        'query ID Some("server-query"))'
+    )
+    connection.to_arrow.side_effect = error
+    connection.to_arrow_batches.side_effect = error
+
+    for action in (
+        frame.to_arrow,
+        frame.to_arrow_batches,
+        frame.schema_with_session,
+        frame.to_polars,
+        lambda session: frame.to_polars(session, use_batches=True),
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            action(session)
+        assert raised.value is error
+
+
+def test_malformed_arrow_ipc_preserves_pyarrow_decode_error(
+    frame, open_session, arrow_result
+):
+    pa = pytest.importorskip("pyarrow")
+    session, connection = open_session()
+    corrupt = b"invalid Arrow stream"
+    connection.to_arrow.return_value = corrupt
+    connection.to_arrow_batches.return_value = iter((_arrow_ipc(arrow_result), corrupt))
+
+    with pytest.raises(pa.ArrowInvalid) as expected:
+        pa.ipc.open_stream(corrupt)
+    with pytest.raises(pa.ArrowInvalid) as materialized:
+        frame.to_arrow(session)
+    batches = frame.to_arrow_batches(session)
+    assert next(batches).equals(arrow_result)
+    with pytest.raises(pa.ArrowInvalid) as streamed:
+        next(batches)
+    assert str(materialized.value) == str(streamed.value) == str(expected.value)
 
 
 def test_to_polars_converts_materialized_and_batched_ipc(

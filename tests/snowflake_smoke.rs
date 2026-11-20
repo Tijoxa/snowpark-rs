@@ -87,6 +87,149 @@ fn snowflake_dataframe() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+#[ignore = "requires a named Snowflake profile with permission to create a temporary table in PUBLIC.PUBLIC"]
+fn snowflake_identifier_resolution_and_quoted_question_marks() -> Result<(), Box<dyn Error>> {
+    with_session(async |session| {
+        session
+            .query("ALTER SESSION SET QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE")
+            .await?;
+        session.query("USE SCHEMA PUBLIC.PUBLIC").await?;
+        let ascii = "A".repeat(255);
+        let unicode = "界".repeat(255);
+        let table = r#""Snowpark.Régression?""#;
+        session.query(format!(
+            "CREATE TEMPORARY TABLE {table} (ID NUMBER(10,0), \"id\" NUMBER(10,0), \"Été?\" VARCHAR, {ascii} NUMBER(10,0), \"{unicode}\" NUMBER(10,0))"
+        )).await?;
+        session
+            .query(format!("INSERT INTO {table} VALUES (1, 2, 'été?', 3, 4)"))
+            .await?;
+
+        for name in [
+            table.to_owned(),
+            format!("PUBLIC.{table}"),
+            format!("PUBLIC.PUBLIC.{table}"),
+        ] {
+            let frame = DataFrame::table_name(&name)?;
+            let result = frame
+                .filter(col(r#""Été?""#).eq(lit("été?")))
+                .select([
+                    col("id").into(),
+                    col(r#""id""#).into(),
+                    col(&ascii).into(),
+                    col(format!("\"{unicode}\"")).into(),
+                    lit("bind?").alias(r#""alias?""#),
+                ])
+                .to_arrow(&session)
+                .await?;
+            assert_eq!(result.num_rows(), 1);
+            for (index, expected) in [1, 2, 3, 4].into_iter().enumerate() {
+                assert_eq!(
+                    decimals(&result, index).iter().collect::<Vec<_>>(),
+                    [Some(expected)]
+                );
+            }
+            assert_eq!(result.schema().field(0).name(), "ID");
+            assert_eq!(result.schema().field(1).name(), "id");
+            assert_eq!(result.schema().field(2).name(), &ascii);
+            assert_eq!(result.schema().field(3).name(), &unicode);
+            assert_eq!(result.schema().field(4).name(), "alias?");
+            assert_eq!(
+                result
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "bind?"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires a named Snowflake profile with permission to create a temporary table in PUBLIC.PUBLIC"]
+fn snowflake_three_valued_logic_on_nullable_cells() -> Result<(), Box<dyn Error>> {
+    with_session(async |session| {
+        session.query(
+            "CREATE TEMPORARY TABLE PUBLIC.PUBLIC.SNOWPARK_RS_BOOLEAN_FIXTURE (ID NUMBER(10,0), L BOOLEAN, R BOOLEAN)"
+        ).await?;
+        session
+            .query(
+                "INSERT INTO PUBLIC.PUBLIC.SNOWPARK_RS_BOOLEAN_FIXTURE VALUES \
+            (1, TRUE, TRUE), (2, TRUE, FALSE), (3, TRUE, NULL), \
+            (4, FALSE, TRUE), (5, FALSE, FALSE), (6, FALSE, NULL), \
+            (7, NULL, TRUE), (8, NULL, FALSE), (9, NULL, NULL)",
+            )
+            .await?;
+        let frame = DataFrame::table_name("PUBLIC.PUBLIC.SNOWPARK_RS_BOOLEAN_FIXTURE")?;
+        let l = col("l");
+        let r = col("r");
+        let result = frame
+            .select([
+                col("id").into(),
+                l.clone().and(r.clone()).alias("both"),
+                l.clone().or(r.clone()).alias("either"),
+                (!l.clone()).alias("negated"),
+                l.clone().eq(r.clone()).alias("equal"),
+                l.clone().is_null().alias("missing"),
+                l.clone().is_not_null().alias("present"),
+                l.clone().eq_missing(r.clone()).alias("equal_missing"),
+            ])
+            .sort(["id"])
+            .to_arrow(&session)
+            .await?;
+        assert_eq!(
+            decimals(&result, 0).values().as_ref(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        let t = Some(true);
+        let f = Some(false);
+        let u = None;
+        for (column, expected) in [
+            [t, f, u, f, f, f, u, f, u],
+            [t, t, t, t, f, u, t, u, u],
+            [f, f, f, t, t, t, u, u, u],
+            [t, f, u, f, t, u, u, u, u],
+            [f, f, f, f, f, f, t, t, t],
+            [t, t, t, t, t, t, f, f, f],
+            [t, f, f, f, t, f, f, f, t],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let values = result
+                .column(column + 1)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            assert_eq!(
+                values.iter().collect::<Vec<_>>(),
+                expected,
+                "{}",
+                result.schema().field(column + 1).name()
+            );
+        }
+        for (predicate, expected) in [
+            (l.clone().and(r.clone()), vec![1]),
+            (l.clone().or(r.clone()), vec![1, 2, 3, 4, 7]),
+            (!l.clone(), vec![4, 5, 6]),
+            (l.clone().eq(r.clone()), vec![1, 5]),
+            (l.is_null(), vec![7, 8, 9]),
+        ] {
+            let filtered = frame
+                .filter(predicate)
+                .select(["id"])
+                .sort(["id"])
+                .to_arrow(&session)
+                .await?;
+            assert_eq!(decimals(&filtered, 0).values().as_ref(), expected);
+        }
+        Ok(())
+    })
+}
+
+#[test]
 #[ignore = "requires a named Snowflake profile and the PUBLIC.PUBLIC.EXAMPLE fixture"]
 fn snowflake_grouped_totals() -> Result<(), Box<dyn Error>> {
     with_session(async |session| {

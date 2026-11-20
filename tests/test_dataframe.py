@@ -8,16 +8,59 @@ from snowpark_rs import Field, Table, UnsupportedPolarsExpression
 
 
 @pytest.mark.parametrize(
-    ("name", "parts"),
+    ("name", "parts", "sql_name"),
     [
-        ("SALES", ["SALES"]),
-        ("PUBLIC.SALES", ["PUBLIC", "SALES"]),
-        ("DB.PUBLIC.SALES", ["DB", "PUBLIC", "SALES"]),
-        ('DB.PUBLIC."Table.With.Dots"', ["DB", "PUBLIC", '"Table.With.Dots"']),
+        ("sales", ["sales"], '"SALES"'),
+        ("public.sales", ["public", "sales"], '"PUBLIC"."SALES"'),
+        ("db.public.sales", ["db", "public", "sales"], '"DB"."PUBLIC"."SALES"'),
+        (
+            'DB.PUBLIC."Ventes.東京?"',
+            ["DB", "PUBLIC", '"Ventes.東京?"'],
+            '"DB"."PUBLIC"."Ventes.東京?"',
+        ),
     ],
 )
-def test_table_name_forms_compile_equivalently(name, parts):
-    assert Table(name).to_sql() == Table(iter(parts)).to_sql()
+def test_table_name_forms_compile_equivalently(name, parts, sql_name):
+    expected = (f"SELECT t0.* FROM {sql_name} AS t0", [])
+    assert Table(name).to_sql() == Table(iter(parts)).to_sql() == expected
+
+
+def test_polars_columns_preserve_exact_unicode_and_case_under_snowflake_rules():
+    frame = Table(
+        "T",
+        schema=[Field("id"), Field('"id"'), Field('"Été"'), Field('"été"')],
+    )
+    assert frame.columns == ["ID", "id", "Été", "été"]
+    assert frame.select("ID", "id", "Été", "été").to_sql() == (
+        'SELECT t0."ID", t0."id", t0."Été", t0."été" FROM "T" AS t0',
+        [],
+    )
+    with pytest.raises(UnsupportedPolarsExpression, match="Column.*absent"):
+        frame.select("Id").to_sql()
+    with pytest.raises(ValueError, match="duplicate output column"):
+        Table("T", schema=[Field("id"), Field('"ID"')])
+    with pytest.raises(ValueError, match="invalid Snowflake identifier"):
+        Table("été")
+
+
+def test_max_identifier_length_and_question_marks_in_quoted_names():
+    name = "界" * 253 + '"?'
+    quoted = '"' + name.replace('"', '""') + '"'
+    frame = Table(quoted, schema=[Field(quoted)])
+    query = frame.filter(pl.col(name) == "value?").select(
+        pl.col(name).alias("alias?"), answer=pl.lit(42)
+    )
+    assert query.to_sql() == (
+        (
+            f'SELECT t0.{quoted} AS "alias?", ? AS "answer" FROM {quoted} AS t0 '
+            f'WHERE t0.{quoted} = ?'
+        ),
+        [42, "value?"],
+    )
+    with pytest.raises(ValueError, match="invalid Snowflake identifier"):
+        Table(quoted[:-1] + 'x"')
+    with pytest.raises(ValueError, match="invalid Snowflake identifier"):
+        frame.select(pl.col(name).alias(name + "x")).to_sql()
 
 
 def test_positional_named_and_iterable_expressions_compile_with_ordered_binds():

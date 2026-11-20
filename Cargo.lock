@@ -4110,6 +4110,7 @@ dependencies = [
  "pyo3",
  "pyo3-polars",
  "serde",
+ "serde_json",
  "snowflake-ast",
  "snowflake-connector-rs",
  "thiserror",

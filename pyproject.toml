@@ -26,6 +26,9 @@ python-source = "src"
 testpaths = ["tests"]
 
 [tool.uv]
+# Both native packages share Cargo's target directory. Their PyO3 ABI
+# configurations differ, so maturin must not generate them concurrently.
+concurrent-builds = 1
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "src/**/*.rs" },
