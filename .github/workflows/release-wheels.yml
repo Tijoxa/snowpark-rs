@@ -1,13 +1,6 @@
 name: Release Python wheels
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/release-wheels.yml
-      - .github/scripts/release_wheels.py
-      - pyproject.toml
-      - crates/snowpark-rs-session/pyproject.toml
   workflow_dispatch:
 
 permissions:
