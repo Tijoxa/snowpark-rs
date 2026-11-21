@@ -69,7 +69,7 @@ macro_rules! snowflake_only_plugin {
 
 snowflake_only_plugin!(try_parse_json);
 snowflake_only_plugin!(try_to_number);
-snowflake_only_plugin!(typeof);
+snowflake_only_plugin!(type_of);
 snowflake_only_plugin!(get_path);
 snowflake_only_plugin!(is_null_value);
 snowflake_only_plugin!(array_construct);

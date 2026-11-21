@@ -15,6 +15,7 @@ CUTOFF = date(2024, 1, 1)
         ("1h", 'DATE_TRUNC(HOUR, t0."TS")'),
         ("15m", "TIME_SLICE(t0.\"TS\", 15, 'MINUTE')"),
         (timedelta(minutes=15), "TIME_SLICE(t0.\"TS\", 15, 'MINUTE')"),
+        ("0ns", 't0."TS"'),
     ],
 )
 def test_truncate_is_a_typed_group_key(every, bucket_sql):
@@ -68,7 +69,8 @@ def test_temporal_components_and_date_truncation_keep_their_types():
 
 @pytest.mark.parametrize("every", ["-1w", "0w", "1w2d", "3invalid", "123456789123456789123ns"])
 def test_truncate_rejects_invalid_constant_periods(every):
-    query = Table("T").group_by(pl.col("TS").dt.truncate(every)).agg(pl.len())
+    source = Table("T", schema=[Field("TS", "TIMESTAMP_LTZ")])
+    query = source.group_by(pl.col("TS").dt.truncate(every)).agg(pl.len())
     with pytest.raises(
         UnsupportedPolarsExpression, match=r"group_by: .*Truncate: "
     ):

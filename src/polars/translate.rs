@@ -822,7 +822,7 @@ impl<'a> Translator<'a> {
         let function = match symbol {
             "try_parse_json" => SnowflakeFunction::TryParseJson,
             "try_to_number" => SnowflakeFunction::TryToNumber,
-            "typeof" => SnowflakeFunction::TypeOf,
+            "type_of" => SnowflakeFunction::TypeOf,
             "get_path" => SnowflakeFunction::GetPath,
             "is_null_value" => SnowflakeFunction::IsNullValue,
             "array_construct" => SnowflakeFunction::ArrayConstruct,

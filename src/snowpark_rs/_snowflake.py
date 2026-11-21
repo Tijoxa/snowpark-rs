@@ -29,7 +29,7 @@ class SnowflakeExpr:
 
     def typeof(self) -> pl.Expr:
         """Return the Snowflake type of the value stored in a VARIANT."""
-        return _call("typeof", self._expr)
+        return _call("type_of", self._expr)
 
     def get_path(self, path: str | pl.Expr) -> pl.Expr:
         """Read a path from a semi-structured value."""

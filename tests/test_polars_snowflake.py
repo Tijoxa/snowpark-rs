@@ -402,7 +402,7 @@ def test_snowflake_conversions_and_json_keep_distinct_nulls(snowflake_session):
     )
     """
     txt = pls.col("TXT").snowflake
-    source = pls.Table("DOCUMENTS").with_columns(DOC=txt.try_parse_json())
+    source = pls.Table("DOCUMENTS").select("ID", "TXT", DOC=txt.try_parse_json())
     source = source.with_columns(VALUE=pls.col("DOC").snowflake.get_path("x"))
     value = pls.col("VALUE").snowflake
     result = source.select(

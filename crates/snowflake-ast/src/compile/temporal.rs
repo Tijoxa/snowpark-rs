@@ -81,7 +81,8 @@ impl Scope<'_> {
         let day = day_bucket("1970-01-01", "units[2]::NUMBER");
         let week = day_bucket("1970-01-05", "(7 * units[1]::NUMBER)");
         let month = month_bucket("units[0]::NUMBER");
-        if !scalar {
+        let guard_null_input = !scalar || check_naive;
+        if guard_null_input {
             query.sql.push_str("CASE WHEN ");
             self.emit_expression(input, query, false, allow_aggregate)?;
             query.sql.push_str(" IS NULL THEN NULL ELSE ");
@@ -117,7 +118,7 @@ impl Scope<'_> {
             ), month, week, day, clock));
             Ok(())
         })?;
-        if !scalar {
+        if guard_null_input {
             query.sql.push_str(" END");
         }
         Ok(())
