@@ -48,9 +48,6 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
             manylinux: "off"
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            manylinux: "off"
     env:
       CARGO_BUILD_JOBS: "2"
     steps:

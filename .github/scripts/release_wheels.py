@@ -20,7 +20,6 @@ PLATFORMS = {
     "win_amd64",
     "manylinux_2_28_x86_64",
     "macosx_*_arm64",
-    "macosx_*_x86_64",
 }
 
 
@@ -91,15 +90,7 @@ def publish(repository: str, commit: str, packages: list[list[str]]) -> None:
                 continue
             if release["target_commitish"] != commit:
                 raise ValueError(f"Draft {tag} targets {release['target_commitish']}, expected {commit}")
-        else:
-            gh(
-                "release", "create", tag, "--repo", repository, "--draft",
-                "--target", commit, "--title", f"{name} {version}",
-                "--notes", "Python wheels for Windows, Linux, and macOS.",
-            )
-            release = releases(repository)[tag]
 
-        uploaded = {asset["name"] for asset in release["assets"] if asset["state"] == "uploaded"}
         with tempfile.TemporaryDirectory() as directory:
             metadata = Path(directory) / "wheel-index.json"
             metadata.write_text(
@@ -114,9 +105,21 @@ def publish(repository: str, commit: str, packages: list[list[str]]) -> None:
                 ) + "\n",
                 encoding="utf-8",
             )
-            missing = [str(file) for file in [*wheels, metadata] if file.name not in uploaded]
-            if missing:
-                gh("release", "upload", tag, *missing, "--repo", repository)
+            files = [*wheels, metadata]
+            if release is None:
+                gh(
+                    "release", "create", tag, *(str(file) for file in files),
+                    "--repo", repository, "--draft", "--target", commit,
+                    "--title", f"{name} {version}",
+                    "--notes", "Python wheels for Windows, Linux, and macOS.",
+                )
+            else:
+                uploaded = {
+                    asset["name"] for asset in release["assets"] if asset["state"] == "uploaded"
+                }
+                missing = [str(file) for file in files if file.name not in uploaded]
+                if missing:
+                    gh("release", "upload", tag, *missing, "--repo", repository, "--clobber")
         result = gh(
             "release", "edit", tag, "--draft=false", "--repo", repository,
             *(["--latest=false"] if name == "snowpark-rs-session" else []),
