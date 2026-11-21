@@ -1,0 +1,127 @@
+name: Release Python wheels
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-wheels.yml
+      - .github/scripts/release_wheels.py
+      - pyproject.toml
+      - crates/snowpark-rs-session/pyproject.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      packages: ${{ steps.plan.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - id: plan
+        run: python .github/scripts/release_wheels.py plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.packages != '[]'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: "off"
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+      - name: Build snowpark-rs
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.16.0
+          rust-toolchain: stable
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          docker-options: --env CARGO_BUILD_JOBS=2
+          args: --release --locked -i python3.13 --out dist
+      - name: Build snowpark-rs-session
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          maturin-version: v1.16.0
+          rust-toolchain: stable
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          docker-options: --env CARGO_BUILD_JOBS=2
+          args: --release --locked -i python3.13 --out dist --manifest-path crates/snowpark-rs-session/Cargo.toml
+      - name: Test the installed wheels
+        shell: bash
+        run: |
+          uv pip install --system dist/*.whl
+          python - <<'PY'
+          import _snowpark_rs_session
+          import polars as pl
+          from snowpark_rs import Session, Table
+
+          _, binds = Table("PUBLIC.PUBLIC.SALES").filter(pl.col("AMOUNT") > 100).to_sql()
+          assert binds == [100]
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: wheel-releases-${{ needs.plan.outputs.packages }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Publish wheels from the release commit
+        run: python .github/scripts/release_wheels.py publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PACKAGES: ${{ needs.plan.outputs.packages }}
