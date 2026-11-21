@@ -1,11 +1,11 @@
 mod star;
+mod temporal;
 
 use std::{cell::Cell, collections::HashSet, sync::Arc};
 
 use crate::{
-    BindValue, Column, CompiledQuery, DataType, Field, JoinType, Projection, SortKey,
-    TemporalBucket, col,
-    expr::{Aggregate, BinaryOp, Expr, ProjectionKind},
+    BindValue, Column, CompiledQuery, DataType, Field, JoinType, Projection, SortKey, col,
+    expr::{Aggregate, BinaryOp, Expr, ProjectionKind, Reduction, ScalarFunction},
     ident::Ident,
     plan::{LogicalPlan, PredicateClause, UnionAlignment},
 };
@@ -63,6 +63,11 @@ pub enum CompileError {
     DuplicateJoinOutput(String),
     #[error("unsupported or invalid Snowflake data type {0:?}")]
     InvalidDataType(String),
+    #[error("{function} does not accept {count} arguments")]
+    InvalidFunctionArity {
+        function: &'static str,
+        count: usize,
+    },
     #[error(
         "expected a finite decimal with at most 38 digits of precision and 37 fractional digits"
     )]
@@ -801,6 +806,38 @@ impl Scope<'_> {
                 }
                 query.binds.push(value.clone());
             }
+            Expr::Null => query.sql.push_str("NULL"),
+            Expr::Case(predicate, truthy, falsy) => {
+                query.sql.push_str("CASE WHEN ");
+                self.emit_expression(predicate, query, false, allow_aggregate)?;
+                query.sql.push_str(" THEN ");
+                self.emit_expression(truthy, query, false, allow_aggregate)?;
+                query.sql.push_str(" ELSE ");
+                self.emit_expression(falsy, query, false, allow_aggregate)?;
+                query.sql.push_str(" END");
+            }
+            Expr::Call(function, args) => {
+                if let ScalarFunction::Snowflake(function) = function
+                    && !function.accepts_arity(args.len())
+                {
+                    return Err(CompileError::InvalidFunctionArity {
+                        function: function.sql(),
+                        count: args.len(),
+                    });
+                }
+                query.sql.push_str(function.sql());
+                query.sql.push('(');
+                for (index, arg) in args.iter().enumerate() {
+                    if index != 0 {
+                        query.sql.push_str(", ");
+                    }
+                    self.emit_expression(arg, query, false, allow_aggregate)?;
+                }
+                if matches!(function, ScalarFunction::CollateUtf8) {
+                    query.sql.push_str(", 'utf8'");
+                }
+                query.sql.push(')');
+            }
             Expr::DateFromEpochDays(days) => {
                 query.sql.push_str("DATEADD(day, ?, DATE '1970-01-01')");
                 query.binds.push(BindValue::Int(*days));
@@ -832,6 +869,20 @@ impl Scope<'_> {
             }
             Expr::TruncateTemporal(inner, bucket) => {
                 self.emit_temporal_truncate(inner, *bucket, query, allow_aggregate)?;
+            }
+            Expr::TruncateTemporalBy {
+                input,
+                every,
+                quantum_ns,
+                scalar,
+            } => {
+                self.emit_temporal_truncate_by(
+                    input,
+                    every,
+                    (*quantum_ns, *scalar),
+                    query,
+                    allow_aggregate,
+                )?;
             }
             Expr::Minute(inner) => {
                 query.sql.push_str("CAST(DATE_PART(MINUTE, ");
@@ -921,10 +972,19 @@ impl Scope<'_> {
                 self.emit_expression(exponent, query, false, allow_aggregate)?;
                 query.sql.push(')');
             }
-            Expr::TryParseJson(inner) => {
-                query.sql.push_str("TRY_PARSE_JSON(");
+            Expr::TryCast(inner, target) => {
+                target.validate()?;
+                if matches!(
+                    target,
+                    DataType::Binary | DataType::Variant | DataType::Array | DataType::Object
+                ) {
+                    return Err(CompileError::InvalidDataType(format!(
+                        "{target} for TRY_CAST"
+                    )));
+                }
+                query.sql.push_str("TRY_CAST(");
                 self.emit_expression(inner, query, false, allow_aggregate)?;
-                query.sql.push(')');
+                query.sql.push_str(&format!(" AS {target})"));
             }
             Expr::Not(inner) => {
                 query.sql.push_str("NOT (");
@@ -1086,70 +1146,6 @@ impl Scope<'_> {
         Ok(())
     }
 
-    fn emit_temporal_truncate(
-        &self,
-        expr: &Expr,
-        bucket: TemporalBucket,
-        query: &mut CompiledQuery,
-        allow_aggregate: bool,
-    ) -> Result<(), CompileError> {
-        let data_type = self.expression_type(expr)?.0;
-        let emit_input =
-            |query: &mut CompiledQuery| self.emit_expression(expr, query, false, allow_aggregate);
-        if bucket == TemporalBucket::Day
-            && let Expr::InTimeZone(_, zone) = expr
-        {
-            // The offset at local midnight can differ from the input's offset.
-            query.sql.push_str(concat!(
-                "CONVERT_TIMEZONE(?, TO_TIMESTAMP_TZ(DATE_PART(EPOCH_NANOSECOND, ",
-                "CONVERT_TIMEZONE(?, 'UTC', DATE_TRUNC(DAY, CAST("
-            ));
-            query
-                .binds
-                .extend([BindValue::Text(zone.clone()), BindValue::Text(zone.clone())]);
-            emit_input(query)?;
-            query.sql.push_str(" AS TIMESTAMP_NTZ)))), 9))");
-            return Ok(());
-        }
-        let (prefix, suffix) = match (bucket, data_type) {
-            (_, Some(DataType::Date)) => return emit_input(query),
-            (TemporalBucket::Day, _) => ("DATE_TRUNC(DAY, ", ")"),
-            (TemporalBucket::Hour, Some(DataType::TimestampNtz)) => ("DATE_TRUNC(HOUR, ", ")"),
-            (TemporalBucket::QuarterHour, Some(DataType::TimestampNtz)) => {
-                ("TIME_SLICE(", ", 15, 'MINUTE')")
-            }
-            // Subtract the elapsed portion of the local bucket from the original instant.
-            // This keeps the two occurrences of a repeated local hour separate.
-            (bucket, _) => {
-                let minutes = if bucket == TemporalBucket::Hour {
-                    60
-                } else {
-                    15
-                };
-                query
-                    .sql
-                    .push_str("DATEADD(NANOSECOND, -(MOD(DATE_PART(MINUTE, ");
-                emit_input(query)?;
-                query
-                    .sql
-                    .push_str(&format!("), {minutes}) * 60000000000 + DATE_PART(SECOND, "));
-                emit_input(query)?;
-                query
-                    .sql
-                    .push_str(") * 1000000000 + DATE_PART(NANOSECOND, ");
-                emit_input(query)?;
-                query.sql.push_str(")), ");
-                emit_input(query)?;
-                query.sql.push(')');
-                return Ok(());
-            }
-        };
-        query.sql.push_str(prefix);
-        emit_input(query)?;
-        query.sql.push_str(suffix);
-        Ok(())
-    }
-
     fn emit_in_list(
         &self,
         expr: &Expr,
@@ -1224,6 +1220,64 @@ impl Scope<'_> {
                 BindValue::Int(_) => (None, Some(false)),
                 BindValue::Float(_) => (Some(DataType::Float), Some(false)),
             },
+            Expr::Null => (None, Some(true)),
+            Expr::Case(_, truthy, falsy) => {
+                let (truthy_type, truthy_nullable) = self.expression_type(truthy)?;
+                let (falsy_type, falsy_nullable) = self.expression_type(falsy)?;
+                let dtype = match (truthy.as_ref(), falsy.as_ref()) {
+                    (Expr::Null, _) => falsy_type,
+                    (_, Expr::Null) => truthy_type,
+                    _ if truthy_type == falsy_type => truthy_type,
+                    _ => None,
+                };
+                (dtype, nullable_either(truthy_nullable, falsy_nullable))
+            }
+            Expr::Call(ScalarFunction::NullIf, args) => {
+                (self.expression_type(&args[0])?.0, Some(true))
+            }
+            Expr::Call(ScalarFunction::Floor, args) => {
+                let (dtype, nullable) = self.expression_type(&args[0])?;
+                let dtype = match dtype {
+                    Some(DataType::Number { .. }) => Some(DataType::Number {
+                        precision: 38,
+                        scale: 0,
+                    }),
+                    _ => dtype,
+                };
+                (dtype, nullable)
+            }
+            Expr::Call(ScalarFunction::LeastIgnoreNulls, _) => (None, None),
+            Expr::Call(ScalarFunction::CollateUtf8, args) => self.expression_type(&args[0])?,
+            Expr::Call(ScalarFunction::Length | ScalarFunction::OctetLength, args) => (
+                Some(DataType::Number {
+                    precision: 10,
+                    scale: 0,
+                }),
+                self.expression_type(&args[0])?.1,
+            ),
+            Expr::Call(
+                function @ (ScalarFunction::StartsWith
+                | ScalarFunction::EndsWith
+                | ScalarFunction::ConcatWs
+                | ScalarFunction::ArrayToString),
+                args,
+            ) => {
+                let dtype = if matches!(
+                    function,
+                    ScalarFunction::StartsWith | ScalarFunction::EndsWith
+                ) {
+                    DataType::Boolean
+                } else {
+                    DataType::Varchar
+                };
+                let nullable = args.iter().try_fold(Some(false), |nullable, arg| {
+                    Ok(nullable_either(nullable, self.expression_type(arg)?.1))
+                })?;
+                (Some(dtype), nullable)
+            }
+            Expr::Call(ScalarFunction::ArrayConstructCompact, _) => {
+                (Some(DataType::Array), Some(false))
+            }
             Expr::Cast(inner, data_type) => (Some(*data_type), self.expression_type(inner)?.1),
             Expr::DateFromEpochDays(_) => (Some(DataType::Date), Some(false)),
             Expr::TimestampFromEpoch(_, _, with_timezone) => (
@@ -1246,6 +1300,13 @@ impl Scope<'_> {
                 (Some(DataType::TimestampTz), self.expression_type(inner)?.1)
             }
             Expr::TruncateTemporal(inner, _) => self.expression_type(inner)?,
+            Expr::TruncateTemporalBy { input, every, .. } => {
+                let (dtype, input_nullable) = self.expression_type(input)?;
+                (
+                    dtype,
+                    nullable_either(input_nullable, self.expression_type(every)?.1),
+                )
+            }
             Expr::Minute(inner) => (
                 Some(DataType::Number {
                     precision: 2,
@@ -1274,7 +1335,15 @@ impl Scope<'_> {
                 },
             ),
             Expr::InQuery(..) => (Some(DataType::Boolean), None),
-            Expr::TryParseJson(_) => (Some(DataType::Variant), Some(true)),
+            Expr::TryCast(_, target) => (Some(*target), Some(true)),
+            Expr::Call(ScalarFunction::Snowflake(function), _) => (
+                Some(function.data_type()),
+                Some(!matches!(
+                    function,
+                    crate::SnowflakeFunction::ArrayConstruct
+                        | crate::SnowflakeFunction::ObjectConstructKeepNull
+                )),
+            ),
             Expr::IsNull(_) | Expr::IsNotNull(_) => (Some(DataType::Boolean), Some(false)),
             Expr::Not(inner) => (Some(DataType::Boolean), self.expression_type(inner)?.1),
             Expr::Negate(inner) => (None, self.expression_type(inner)?.1),
@@ -1329,6 +1398,17 @@ impl Scope<'_> {
             }
             Expr::Aggregate(Aggregate::CountAll | Aggregate::Count(_)) => (None, Some(false)),
             Expr::Aggregate(Aggregate::Sum(_)) => (None, Some(true)),
+            Expr::Aggregate(Aggregate::Reduce(reduction, inner)) => {
+                let dtype = match reduction {
+                    Reduction::All | Reduction::Any => Some(DataType::Boolean),
+                    Reduction::Mean => self
+                        .expression_type(inner)?
+                        .0
+                        .filter(|dtype| *dtype == DataType::Float),
+                    Reduction::Min | Reduction::Max => self.expression_type(inner)?.0,
+                };
+                (dtype, Some(true))
+            }
             Expr::Aggregate(Aggregate::SumOrZero(_)) | Expr::RowNumber => (None, Some(false)),
             Expr::Over { function, .. } => self.expression_type(function)?,
         })
@@ -1454,6 +1534,7 @@ impl Scope<'_> {
             Aggregate::Count(arg) => ("COUNT", arg),
             Aggregate::Sum(arg) => ("SUM", arg),
             Aggregate::SumOrZero(arg) => ("COALESCE(SUM", arg),
+            Aggregate::Reduce(reduction, arg) => (reduction.sql(), arg),
         };
         query.sql.push_str(function);
         query.sql.push('(');

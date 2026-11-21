@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -14,6 +14,7 @@ CUTOFF = date(2024, 1, 1)
         ("1d", 'DATE_TRUNC(DAY, t0."TS")'),
         ("1h", 'DATE_TRUNC(HOUR, t0."TS")'),
         ("15m", "TIME_SLICE(t0.\"TS\", 15, 'MINUTE')"),
+        (timedelta(minutes=15), "TIME_SLICE(t0.\"TS\", 15, 'MINUTE')"),
     ],
 )
 def test_truncate_is_a_typed_group_key(every, bucket_sql):
@@ -37,9 +38,8 @@ def test_truncate_is_a_typed_group_key(every, bucket_sql):
 def test_subday_truncate_compiles_without_a_declared_schema():
     bucket = pl.col("TS").dt.truncate("15m").alias("BUCKET")
     sql, binds = Table("T").group_by(bucket).agg(pl.len()).to_sql()
-    assert sql.startswith(
-        'SELECT DATEADD(NANOSECOND, -(MOD(DATE_PART(MINUTE, t0."TS"), 15)'
-    )
+    assert 'DATE_PART(EPOCH_NANOSECOND, local_time)' in sql
+    assert 'AS_TIMESTAMP_LTZ(TO_VARIANT(original))' in sql
     assert sql.endswith("GROUP BY 1")
     assert binds == []
 
@@ -66,13 +66,28 @@ def test_temporal_components_and_date_truncation_keep_their_types():
         table.select(pl.col("D").dt.minute()).to_sql()
 
 
-@pytest.mark.parametrize("every", ["1w", pl.col("EVERY")])
-def test_truncate_reports_unsupported_periods(every):
+@pytest.mark.parametrize("every", ["-1w", "0w", "1w2d", "3invalid", "123456789123456789123ns"])
+def test_truncate_rejects_invalid_constant_periods(every):
     query = Table("T").group_by(pl.col("TS").dt.truncate(every)).agg(pl.len())
     with pytest.raises(
-        UnsupportedPolarsExpression, match=r"group_by: .*Truncate: .*constant duration"
+        UnsupportedPolarsExpression, match=r"group_by: .*Truncate: "
     ):
         query.to_sql()
+
+
+def test_truncate_combines_duration_shape_type_and_bind_order():
+    source = Table("T", schema=[Field("D", "DATE", nullable=False), Field("N", "NUMBER")])
+    every = pl.when(pl.col("N") > 5).then(pl.lit("2w")).otherwise(pl.lit(None, pl.String))
+    query = source.group_by(pl.col("D").dt.truncate(every).alias("BUCKET")).agg(pl.len())
+    sql, binds = query.to_sql()
+    assert 'CASE WHEN t0."N" > ? THEN ? ELSE CAST(? AS VARCHAR) END' in sql
+    assert binds == [5, "2w", None]
+    assert query.schema is not None
+    assert query.schema[0].data_type == "DATE"
+    assert query.schema[0].nullable is True
+
+    with pytest.raises(UnsupportedPolarsExpression, match="duration expression must produce strings"):
+        source.select(pl.col("D").dt.truncate(pl.col("N"))).to_sql()
 
 
 def test_polars_and_python_dates_compile_to_the_same_filter_without_a_schema():

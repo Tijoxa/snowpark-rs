@@ -28,7 +28,7 @@ pub use dataframe::{DataFrame, GroupedDataFrame};
 pub use session::Session;
 pub use snowflake_ast::{
     BindValue, Column, CompileError, CompiledQuery, DataType, Decimal, Field, JoinType, Projection,
-    SortKey, Star, col, count, count_all, lit, lit_null, row_number, star, sum,
+    SnowflakeFunction, SortKey, Star, col, count, count_all, lit, lit_null, row_number, star, sum,
 };
 
 pub fn add(left: u64, right: u64) -> u64 {

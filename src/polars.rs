@@ -164,7 +164,7 @@ pub(crate) fn select(input: &AstFrame, exprs: &[Expr], context: &Context<'_>) ->
         return Ok(input.clone());
     }
     let translator = Translator::new(input, "select", context)?;
-    let values = translator.expressions(exprs)?;
+    let (input, values) = translator.group_values(input, &[], &[], exprs)?;
     let output = projections(&translator, &values)?;
     if values.iter().any(|expr| expr.shape == Shape::Aggregate) {
         if values.iter().any(|expr| expr.shape == Shape::Row) {
@@ -271,12 +271,13 @@ pub(crate) fn aggregate(
     context: &Context<'_>,
 ) -> Result<AstFrame> {
     let grouping = Translator::new(input, "group_by", context)?;
-    let mut by = grouping.expressions(keys)?;
+    let expanded_keys = grouping.expand_all(keys)?;
+    let mut by = grouping.translate_expanded(&expanded_keys)?;
     if (!keys.is_empty() && by.is_empty()) || by.iter().any(|expr| expr.shape != Shape::Row) {
         return Err(grouping.error("group key", "grouping requires row-wise expressions"));
     }
     let translator = grouping.for_operation("agg");
-    let values = translator.expressions(exprs)?;
+    let (input, values) = translator.group_values(input, &expanded_keys, &by, exprs)?;
     if values.iter().any(|expr| expr.shape == Shape::Row) {
         return Err(translator.error(
             "Agg",

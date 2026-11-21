@@ -1,4 +1,7 @@
+mod reductions;
 mod regex;
+mod strings;
+mod temporal;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -15,13 +18,14 @@ use polars_plan::{
     },
     prelude::{DynLiteralValue, LiteralValue},
 };
-use snowflake_ast::{TemporalBucket, TimestampUnit};
+use snowflake_ast::{SnowflakeFunction, TimestampUnit};
 
 use super::{AstFrame, Context, Result, unsupported};
 use crate::{
     BindValue, Column, CompileError, DataType, Decimal, Field, Projection, col, count, count_all,
     lit, lit_null,
 };
+use reductions::GroupProjection;
 
 pub(super) const BROADCAST: &str = "broadcasting a reduction over input rows is unsupported";
 pub(super) const DECLARE_SCHEMA: &str = "declare the source schema or select named columns first";
@@ -63,6 +67,7 @@ struct Value {
     shape: Shape,
     dtype: Option<DataType>,
     zone: Option<TimeZone>,
+    time_unit: Option<TimeUnit>,
     untyped_null: bool,
 }
 
@@ -73,6 +78,7 @@ impl Value {
             shape,
             dtype,
             zone: None,
+            time_unit: None,
             untyped_null: false,
         }
     }
@@ -87,16 +93,17 @@ impl Value {
         } else {
             DataType::TimestampNtz
         };
-        let unit = match unit {
+        let sql_unit = match unit {
             TimeUnit::Milliseconds => TimestampUnit::Milliseconds,
             TimeUnit::Microseconds => TimestampUnit::Microseconds,
             TimeUnit::Nanoseconds => TimestampUnit::Nanoseconds,
         };
         let mut result = Self::scalar(
-            Column::timestamp_from_epoch(value, unit, zone.is_some()),
+            Column::timestamp_from_epoch(value, sql_unit, zone.is_some()),
             dtype,
         );
         result.zone = zone;
+        result.time_unit = Some(unit);
         result
     }
 
@@ -113,6 +120,8 @@ pub(super) struct Translator<'a> {
     context: &'a Context<'a>,
     pub(super) schema: Option<SchemaColumns>,
     clause_source: Option<Option<SchemaColumns>>,
+    group: Option<&'a GroupProjection>,
+    partition: Option<&'a [Column]>,
 }
 
 impl<'a> Translator<'a> {
@@ -126,6 +135,8 @@ impl<'a> Translator<'a> {
             context,
             schema: input.schema()?.map(schema_columns),
             clause_source: None,
+            group: None,
+            partition: None,
         })
     }
 
@@ -143,28 +154,39 @@ impl<'a> Translator<'a> {
     }
 
     pub(super) fn expressions(&self, expressions: &[Expr]) -> Result<Vec<Translation>> {
-        let mut output = Vec::new();
+        self.translate_expanded(&self.expand_all(expressions)?)
+    }
+
+    pub(super) fn expand_all(&self, expressions: &[Expr]) -> Result<Vec<Expr>> {
+        let mut expanded = Vec::new();
         for expr in expressions {
-            for expr in self.expand(expr)? {
+            expanded.extend(self.expand(expr)?);
+        }
+        Ok(expanded)
+    }
+
+    pub(super) fn translate_expanded(&self, expressions: &[Expr]) -> Result<Vec<Translation>> {
+        expressions
+            .iter()
+            .map(|expr| {
                 let value = self.visit(
-                    &expr,
+                    expr,
                     matches!(self.operation, "filter" | "having" | "qualify"),
                 )?;
-                let reference = match unalias(&expr) {
+                let reference = match unalias(expr) {
                     Expr::Column(name) => Some(name.to_string()),
                     _ => None,
                 };
-                output.push(Translation {
+                Ok(Translation {
                     column: value.column,
                     shape: value.shape,
                     dtype: value.dtype,
                     untyped_null: value.untyped_null,
-                    name: output_name(&expr).to_owned(),
+                    name: output_name(expr).to_owned(),
                     reference,
-                });
-            }
-        }
-        Ok(output)
+                })
+            })
+            .collect()
     }
 
     fn expand(&self, expr: &Expr) -> Result<Vec<Expr>> {
@@ -233,6 +255,7 @@ impl<'a> Translator<'a> {
                 options,
             } => self.cast(expr, dtype, *options),
             Expr::BinaryExpr { left, op, right } => self.binary(*op, left, right, allow_subquery),
+            Expr::Ternary { predicate, truthy, falsy } => self.ternary(predicate, truthy, falsy),
             Expr::Function { input, function } => self.function(function, input, allow_subquery),
             Expr::Agg(AggExpr::Sum(inner)) => self.aggregate(inner, true),
             Expr::Agg(AggExpr::Count {
@@ -242,25 +265,26 @@ impl<'a> Translator<'a> {
             Expr::Agg(AggExpr::Count {
                 input,
                 include_nulls: true,
-            }) => {
-                if self.schema.is_none() || !matches!(input.as_ref(), Expr::Column(_)) {
-                    return Err(self.error("Agg.Count", "Expr.len() requires a named column with a known schema; use pl.len() for the row count"));
-                }
-                self.visit(input, false)?;
-                Ok(Value::new(count_all(), Shape::Aggregate, Some(ROW_COUNT)))
-            }
-            Expr::Len => Ok(Value::new(count_all(), Shape::Aggregate, Some(ROW_COUNT))),
+            }) => self.series_len(input),
+            Expr::Len => Ok(Value::new(self.in_partition(count_all()), Shape::Aggregate, Some(ROW_COUNT))),
             Expr::Over {
                 function,
                 partition_by,
                 order_by: None,
                 mapping: WindowMapping::GroupsToRows,
-            } => self.window(function, partition_by),
+            } if self.partition.is_none() => self.window(function, partition_by),
             Expr::Over { .. } => Err(self.error(
                 "Over",
                 "supported windows use a single sum, count or len reduction and groups_to_rows without order_by",
             )),
             Expr::AnonymousFunction { .. } => Err(self.error("AnonymousFunction", NO_TRANSLATION)),
+            Expr::Agg(AggExpr::Mean(input)) => self.reduce(input, snowflake_ast::Reduction::Mean),
+            Expr::Agg(AggExpr::Min { input, propagate_nans: false }) => {
+                self.reduce(input, snowflake_ast::Reduction::Min)
+            }
+            Expr::Agg(AggExpr::Max { input, propagate_nans: false }) => {
+                self.reduce(input, snowflake_ast::Reduction::Max)
+            }
             Expr::Agg(_) => Err(self.error("Agg", format!("{NO_TRANSLATION} for {expr:?}"))),
             Expr::Cast { .. } => Err(self.error("Cast", "a concrete Polars dtype is required")),
             _ => Err(self.error(format!("{expr:?}"), NO_TRANSLATION)),
@@ -289,6 +313,12 @@ impl<'a> Translator<'a> {
     }
 
     fn window(&self, function: &Expr, partition_by: &[Expr]) -> Result<Value> {
+        if !matches!(
+            unalias(function),
+            Expr::Agg(AggExpr::Sum(_) | AggExpr::Count { .. }) | Expr::Len
+        ) {
+            return Err(self.error("Over", "a sum, count or len window reduction is required"));
+        }
         let source = self.source_translator();
         let function = source.visit(function, false)?;
         if function.shape != Shape::Aggregate {
@@ -317,6 +347,8 @@ impl<'a> Translator<'a> {
             context: self.context,
             schema: self.clause_source.as_ref().unwrap_or(&self.schema).clone(),
             clause_source: None,
+            group: None,
+            partition: self.partition,
         }
     }
 
@@ -437,7 +469,12 @@ impl<'a> Translator<'a> {
         } else {
             inner.column.cast(target)
         };
-        Ok(Value::new(column, inner.shape, Some(target)))
+        let mut value = Value::new(column, inner.shape, Some(target));
+        if let PolarsType::Datetime(unit, zone) = dtype {
+            value.time_unit = Some(*unit);
+            value.zone = zone.clone();
+        }
+        Ok(value)
     }
 
     fn binary(
@@ -476,7 +513,7 @@ impl<'a> Translator<'a> {
         );
         let logical = matches!(op, And | Or | LogicalAnd | LogicalOr);
         let comparison = op.is_comparison();
-        if matches!(op, FloorDivide | TruncDivide | RustDivide | Xor) {
+        if matches!(op, TruncDivide | RustDivide | Xor) {
             return Err(self.error(node, NO_TRANSLATION));
         }
         let allow_child = allow_subquery && matches!(op, And | LogicalAnd);
@@ -542,7 +579,32 @@ impl<'a> Translator<'a> {
                     lhs.dtype,
                 ));
             }
-            FloorDivide | TruncDivide | RustDivide | Xor => unreachable!(),
+            FloorDivide => {
+                if [lhs.dtype, rhs.dtype]
+                    .into_iter()
+                    .flatten()
+                    .any(|dtype| !integral(dtype))
+                {
+                    return Err(self.error(node, "floor division requires integer operands"));
+                }
+                let zero = lit(0);
+                let divisor = right_column.null_if(zero.clone());
+                let remainder = left.clone() % divisor.clone();
+                // Snowflake rounds fixed-point division. Divide an exact multiple
+                // and adjust a negative quotient with a nonzero remainder.
+                let adjust = remainder
+                    .clone()
+                    .ne(zero.clone())
+                    .and(left.clone().lt(zero.clone()).ne(divisor.clone().lt(zero)));
+                let quotient = ((left - remainder) / divisor).cast(number(38, 0));
+                (quotient - adjust.case_when(lit(1), lit(0))).cast(number(38, 0))
+            }
+            TruncDivide | RustDivide | Xor => unreachable!(),
+        };
+        let dtype = if op == FloorDivide {
+            Some(number(38, 0))
+        } else {
+            dtype
         };
         Ok(Value::new(column, shape, dtype))
     }
@@ -614,6 +676,23 @@ impl<'a> Translator<'a> {
     ) -> Result<Value> {
         use BooleanFunction::{IsIn, IsNotNull, IsNull, Not};
         match (function, input) {
+            (FunctionExpr::Boolean(BooleanFunction::All { ignore_nulls: true }), [expr]) => {
+                self.reduce(expr, snowflake_ast::Reduction::All)
+            }
+            (FunctionExpr::Boolean(BooleanFunction::Any { ignore_nulls: true }), [expr]) => {
+                self.reduce(expr, snowflake_ast::Reduction::Any)
+            }
+            (FunctionExpr::FillNull, [expr, fallback]) => self.fill_null(expr, fallback),
+            (FunctionExpr::MinHorizontal, args) if !args.is_empty() => self.min_horizontal(args),
+            (FunctionExpr::Floor, [expr]) => {
+                let inner = self.visit(expr, false)?;
+                self.require_numeric("Function.Floor", &[&inner])?;
+                let dtype = match inner.dtype {
+                    Some(DataType::Number { .. }) => Some(number(38, 0)),
+                    dtype => dtype,
+                };
+                Ok(Value::new(inner.column.floor(), inner.shape, dtype))
+            }
             (FunctionExpr::Boolean(IsIn { nulls_equal }), [left, right]) => {
                 self.membership(left, right, *nulls_equal, allow_subquery)
             }
@@ -690,26 +769,39 @@ impl<'a> Translator<'a> {
                 [expr, pattern],
             ) => self.string_contains(expr, pattern, *literal, *strict),
             (
+                FunctionExpr::StringExpr(StringFunction::ConcatHorizontal {
+                    delimiter,
+                    ignore_nulls,
+                }),
+                args,
+            ) if !args.is_empty() => self.concat_strings(args, delimiter, *ignore_nulls),
+            (
+                FunctionExpr::StringExpr(
+                    function @ (StringFunction::LenChars | StringFunction::LenBytes),
+                ),
+                [expr],
+            ) => self.string_length(expr, matches!(function, StringFunction::LenBytes)),
+            (
+                FunctionExpr::StringExpr(
+                    function @ (StringFunction::StartsWith | StringFunction::EndsWith),
+                ),
+                [expr, pattern],
+            ) => self.string_boundary(expr, pattern, matches!(function, StringFunction::EndsWith)),
+            (
                 FunctionExpr::FfiPlugin {
                     lib,
                     symbol,
                     kwargs,
                     ..
                 },
-                [expr],
-            ) if symbol == "try_parse_json"
-                && kwargs.is_empty()
+                args,
+            ) if kwargs.is_empty()
                 && self
                     .context
                     .plugin_path
                     .is_some_and(|path| path.is_absolute() && Path::new(lib.as_str()) == path) =>
             {
-                let inner = self.visit(expr, false)?;
-                Ok(Value::new(
-                    inner.column.try_parse_json(),
-                    inner.shape,
-                    Some(DataType::Variant),
-                ))
+                self.snowflake_function(symbol.as_str(), args)
             }
             (FunctionExpr::FfiPlugin { .. }, _) => Err(self.error(
                 "Function.FfiPlugin",
@@ -725,21 +817,40 @@ impl<'a> Translator<'a> {
         }
     }
 
-    fn truncate(&self, expr: &Expr, every: &Expr) -> Result<Value> {
-        let node = "Function.TemporalExpr.Truncate";
-        let bucket = match string_literal(every) {
-            Some("1d") => TemporalBucket::Day,
-            Some("1h") => TemporalBucket::Hour,
-            Some("15m") => TemporalBucket::QuarterHour,
-            _ => return Err(self.error(node, "expected a constant duration of 1d, 1h, or 15m")),
+    fn snowflake_function(&self, symbol: &str, args: &[Expr]) -> Result<Value> {
+        let node = "Function.FfiPlugin";
+        let function = match symbol {
+            "try_parse_json" => SnowflakeFunction::TryParseJson,
+            "try_to_number" => SnowflakeFunction::TryToNumber,
+            "typeof" => SnowflakeFunction::TypeOf,
+            "get_path" => SnowflakeFunction::GetPath,
+            "is_null_value" => SnowflakeFunction::IsNullValue,
+            "array_construct" => SnowflakeFunction::ArrayConstruct,
+            "object_construct_keep_null" => SnowflakeFunction::ObjectConstructKeepNull,
+            _ => return Err(self.error(node, "only registered Snowflake plugins are supported")),
         };
-        let mut inner = self.visit(expr, false)?;
-        if inner.untyped_null || inner.dtype.is_some() && !is_temporal(inner.dtype) {
-            return Err(self.error(node, "a date or timestamp is required"));
+        if !function.accepts_arity(args.len()) {
+            return Err(self.error(
+                node,
+                format!(
+                    "{} does not accept {} arguments",
+                    function.sql(),
+                    args.len()
+                ),
+            ));
         }
-        inner = inner.in_expression_time_zone();
-        inner.column = inner.column.truncate_temporal(bucket);
-        Ok(inner)
+        let mut shape = Shape::Scalar;
+        let mut columns = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.visit(arg, false)?;
+            shape = self.combine_shape(node, shape, value.shape)?;
+            columns.push(value.column);
+        }
+        Ok(Value::new(
+            Column::snowflake_call(function, columns),
+            shape,
+            Some(function.data_type()),
+        ))
     }
 
     fn string_contains(
@@ -962,10 +1073,11 @@ impl<'a> Translator<'a> {
 
     fn aggregate(&self, expr: &Expr, is_sum: bool) -> Result<Value> {
         let mut inner = if self.clause_source.is_some() {
-            self.source_translator().visit(expr, false)?
+            self.source_translator().reduction_input(expr)?
         } else {
-            self.visit(expr, false)?
-        };
+            self.reduction_input(expr)?
+        }
+        .mask();
         let node = if is_sum { "Agg.Sum" } else { "Agg.Count" };
         if inner.shape == Shape::Aggregate {
             return Err(self.error(node, "nested aggregates are unsupported"));
@@ -974,7 +1086,11 @@ impl<'a> Translator<'a> {
             return Ok(if inner.shape == Shape::Scalar {
                 Value::scalar(inner.column.is_not_null().cast(ROW_COUNT), ROW_COUNT)
             } else {
-                Value::new(count(inner.column), Shape::Aggregate, Some(ROW_COUNT))
+                Value::new(
+                    self.in_partition(count(inner.column)),
+                    Shape::Aggregate,
+                    Some(ROW_COUNT),
+                )
             });
         }
         if inner.dtype == Some(DataType::Boolean) {
@@ -994,7 +1110,7 @@ impl<'a> Translator<'a> {
             ));
         }
         Ok(Value::new(
-            inner.column.sum_or_zero(),
+            self.in_partition(inner.column.sum_or_zero()),
             Shape::Aggregate,
             inner.dtype,
         ))
@@ -1058,7 +1174,17 @@ fn output_name(expr: &Expr) -> &str {
         Expr::BinaryExpr { left, .. }
         | Expr::Cast { expr: left, .. }
         | Expr::Over { function: left, .. }
-        | Expr::Agg(AggExpr::Sum(left) | AggExpr::Count { input: left, .. }) => output_name(left),
+        | Expr::Sort { expr: left, .. }
+        | Expr::Slice { input: left, .. }
+        | Expr::Filter { input: left, .. }
+        | Expr::Ternary { truthy: left, .. }
+        | Expr::Agg(
+            AggExpr::Sum(left)
+            | AggExpr::Mean(left)
+            | AggExpr::Count { input: left, .. }
+            | AggExpr::Min { input: left, .. }
+            | AggExpr::Max { input: left, .. },
+        ) => output_name(left),
         Expr::Function { input, .. } if !input.is_empty() => output_name(&input[0]),
         Expr::Len => "len",
         _ => "literal",
@@ -1082,6 +1208,10 @@ const fn number(precision: u8, scale: u8) -> DataType {
 
 fn numeric(dtype: Option<DataType>) -> bool {
     matches!(dtype, Some(DataType::Float | DataType::Number { .. }))
+}
+
+fn integral(dtype: DataType) -> bool {
+    matches!(dtype, DataType::Number { scale: 0, .. })
 }
 
 fn is_zoned(dtype: Option<DataType>) -> bool {

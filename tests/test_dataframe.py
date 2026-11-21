@@ -162,12 +162,12 @@ def test_typed_expression_bridge_matches_rust_without_json(monkeypatch):
         ),
         [2, 100],
     )
-    invalid = sales.select((pl.col("AMOUNT") // 2) + 1).limit(5)
+    invalid = sales.select((pl.col("AMOUNT") // 2.5) + 1).limit(5)
     with pytest.raises(UnsupportedPolarsExpression) as error:
         _ = invalid.schema
     assert (
         str(error.value)
-        == "select: BinaryExpr.FloorDivide: no translation to Snowflake SQL"
+        == "select: BinaryExpr.FloorDivide: floor division requires integer operands"
     )
 
 
@@ -283,7 +283,7 @@ def test_sort_cast_and_arithmetic_emit_explicit_null_order_and_types():
     ("expression", "diagnostic"),
     [
         (pl.col("X").rolling_sum(2) + 1, "Function.RollingExpr"),
-        (pl.col("X") // 2, "BinaryExpr.FloorDivide"),
+        (pl.col("X").sort().slice(1, 2).mean(), "only head and tail"),
         (pl.col("X") / pl.col("Y"), "nonzero numeric literal divisor"),
         (pl.col("X").sum() + pl.col("X"), "broadcasting"),
         (pl.col("X").cast(pl.Int64, strict=False), "only strict casts"),

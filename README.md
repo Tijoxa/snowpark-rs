@@ -65,15 +65,20 @@ True division requires a nonzero literal divisor. The supported Polars windows
 are `sum()`, `count()` and `pl.len()` over whole partitions with the default
 `groups_to_rows` mapping. Rust also exposes `row_number(partition_by, order_by)`.
 
-Temporal group keys accept `pl.col("TS").dt.truncate("1d")`, `"1h"` and
-`"15m"`. The compiler also supports `dt.date()` and `dt.minute()`.
-`TIMESTAMP_LTZ` operations use the Snowflake session time zone. Declare a
-`DATE` column in the table schema to retain its type for sub-day truncation.
+`dt.truncate()` accepts duration strings, Python `timedelta` values and
+string expressions such as `pl.col("PERIOD")`. Use `ns`, `us`, `ms`, `s`,
+`m`, `h`, `d`, `w`, `mo`, `q` and `y` with multipliers and compatible
+combinations such as `2h30m` or `1y2mo`. Week buckets start on Monday.
+`TIMESTAMP_LTZ` operations use the Snowflake session time zone. Declare `DATE`
+columns in the table schema to preserve their type for arbitrary buckets.
 
 `str.contains(..., literal=True)` accepts a string or an expression for the
 pattern and matches using UTF-8 collation. Regex mode accepts constant patterns
 in a subset shared with Snowflake, including alternation, anchors, and a
 leading `(?i)` flag. Invalid regex patterns produce `NULL` with `strict=False`.
+`starts_with`, `ends_with`, `len_chars`, `len_bytes` and horizontal `concat_str`
+can also be used in translated expressions. `concat_str` accepts strings and
+integers, and respects `ignore_nulls`.
 
 Call `having` on an aggregation to filter groups by keys, aggregates, or
 their aliases. Call `qualify` with a window function in the current projection
@@ -150,6 +155,9 @@ query = payloads.select(
 Both forms produce a genuine `pl.Expr`. The native plugin reports a Polars
 `ComputeError` if evaluated locally. A Snowflake query compiles it to
 `TRY_PARSE_JSON`, which returns a `VARIANT` or SQL `NULL` for invalid JSON.
+The namespace also exposes `try_to_number()`, `typeof()`, `get_path(path)`,
+`is_null_value()`, `array_construct()` and `object_construct_keep_null()`.
+Use `is_null_value()` for JSON null and Polars `is_null()` for SQL `NULL`.
 The package pins Polars 2.1.0 and uses that release's 32-bit runtime.
 `pyo3-polars` imports expressions at compilation time for the shared Rust
 translator. The expression format and plugin ABI are tied to that release.

@@ -32,29 +32,50 @@ extern "C" fn _polars_plugin_get_version() -> u32 {
 
 #[unsafe(no_mangle)]
 extern "C" fn _polars_plugin_get_last_error_message() -> *const c_char {
-    c"TRY_PARSE_JSON requires a snowpark_rs.Table and runs on Snowflake".as_ptr()
+    c"This Snowflake function requires a snowpark_rs.Table".as_ptr()
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn _polars_plugin_field_try_parse_json(
-    _fields: *const c_void,
-    _len: usize,
-    _result: *mut c_void,
-    _kwargs: *const u8,
-    _kwargs_len: usize,
-) {
-    // Leave the empty ArrowSchema untouched to signal failure during planning.
+macro_rules! snowflake_only_plugin {
+    ($name:ident) => {
+        mod $name {
+            use super::*;
+
+            #[unsafe(export_name = concat!("_polars_plugin_field_", stringify!($name)))]
+            extern "C" fn field(
+                _fields: *const c_void,
+                _len: usize,
+                _result: *mut c_void,
+                _kwargs: *const u8,
+                _kwargs_len: usize,
+            ) {
+                // Leave the empty ArrowSchema untouched to fail local planning.
+            }
+
+            #[unsafe(export_name = concat!("_polars_plugin_", stringify!($name)))]
+            unsafe extern "C" fn run(
+                inputs: *mut SeriesExport,
+                len: usize,
+                _kwargs: *const u8,
+                _kwargs_len: usize,
+                _result: *mut SeriesExport,
+                _context: *const c_void,
+            ) {
+                // SAFETY: Polars transfers ownership of its initialized exports.
+                unsafe { release_inputs(inputs, len) };
+            }
+        }
+    };
 }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn _polars_plugin_try_parse_json(
-    inputs: *mut SeriesExport,
-    len: usize,
-    _kwargs: *const u8,
-    _kwargs_len: usize,
-    _result: *mut SeriesExport,
-    _context: *const c_void,
-) {
+snowflake_only_plugin!(try_parse_json);
+snowflake_only_plugin!(try_to_number);
+snowflake_only_plugin!(typeof);
+snowflake_only_plugin!(get_path);
+snowflake_only_plugin!(is_null_value);
+snowflake_only_plugin!(array_construct);
+snowflake_only_plugin!(object_construct_keep_null);
+
+unsafe fn release_inputs(inputs: *mut SeriesExport, len: usize) {
     // The 0.1 ABI transfers ownership of the exported arrays and series even
     // when the call fails. Normally field inference rejects the call first.
     for index in 0..len {

@@ -93,12 +93,12 @@ fn compilation_errors_never_submit_and_quoted_question_marks_keep_bind_order() {
         #[cfg(feature = "polars")]
         (
             source.select_polars([
-                snowpark_rs::polars::col("ID").floor_div(snowpark_rs::polars::lit(2))
+                snowpark_rs::polars::col("ID").floor_div(snowpark_rs::polars::lit(2.5))
             ]),
             CompileError::UnsupportedExpression {
                 operation: "select",
                 node: "BinaryExpr.FloorDivide".into(),
-                reason: "no translation to Snowflake SQL".into(),
+                reason: "floor division requires integer operands".into(),
             },
         ),
         (

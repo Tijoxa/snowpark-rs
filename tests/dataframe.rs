@@ -44,12 +44,12 @@ fn defers_polars_errors_through_native_plan_nodes() -> Result<(), CompileError> 
 
     let source = DataFrame::table_name("SALES")?;
     let invalid = source
-        .select_polars([col("AMOUNT").floor_div(lit(2)) + lit(1)])
+        .select_polars([col("AMOUNT").floor_div(lit(2.5)) + lit(1)])
         .limit(5);
     let expected = CompileError::UnsupportedExpression {
         operation: "select",
         node: "BinaryExpr.FloorDivide".into(),
-        reason: "no translation to Snowflake SQL".into(),
+        reason: "floor division requires integer operands".into(),
     };
     assert_eq!(invalid.schema().unwrap_err(), expected);
     assert_eq!(invalid.to_sql().unwrap_err(), expected);

@@ -71,6 +71,42 @@ pub fn row_number(
 }
 
 impl Column {
+    /// A SQL NULL whose type is inferred from its expression context.
+    pub fn null() -> Self {
+        Self(Expr::Null)
+    }
+
+    /// Select one of two values using SQL CASE semantics.
+    pub fn case_when(self, truthy: Self, falsy: Self) -> Self {
+        Self(Expr::Case(
+            Box::new(self.0),
+            Box::new(truthy.0),
+            Box::new(falsy.0),
+        ))
+    }
+
+    pub fn null_if(self, other: Self) -> Self {
+        Self(Expr::Call(ScalarFunction::NullIf, vec![self.0, other.0]))
+    }
+
+    pub fn floor(self) -> Self {
+        Self(Expr::Call(ScalarFunction::Floor, vec![self.0]))
+    }
+
+    pub fn least_ignore_nulls(columns: impl IntoIterator<Item = Self>) -> Self {
+        Self(Expr::Call(
+            ScalarFunction::LeastIgnoreNulls,
+            columns.into_iter().map(|column| column.0).collect(),
+        ))
+    }
+
+    pub fn reduce(self, reduction: Reduction) -> Self {
+        Self(Expr::Aggregate(Aggregate::Reduce(
+            reduction,
+            Box::new(self.0),
+        )))
+    }
+
     /// Represent the instant in the specified time zone.
     pub fn in_time_zone(self, zone: impl Into<String>) -> Self {
         Self(Expr::InTimeZone(Box::new(self.0), zone.into()))
@@ -81,6 +117,15 @@ impl Column {
         Self(Expr::TruncateTemporal(Box::new(self.0), bucket))
     }
 
+    pub fn truncate_temporal_by(self, every: Self, quantum_ns: u64, scalar: bool) -> Self {
+        Self(Expr::TruncateTemporalBy {
+            input: Box::new(self.0),
+            every: Box::new(every.0),
+            quantum_ns,
+            scalar,
+        })
+    }
+
     /// Extract the minute of a timestamp or time.
     pub fn minute(self) -> Self {
         Self(Expr::Minute(Box::new(self.0)))
@@ -89,6 +134,55 @@ impl Column {
     /// Search for a literal substring using Snowflake's UTF-8 collation.
     pub fn contains_text(self, pattern: Self) -> Self {
         Self(Expr::ContainsText(Box::new(self.0), Box::new(pattern.0)))
+    }
+
+    /// Measure the length of a string in characters or UTF-8 bytes.
+    pub fn text_length(self, bytes: bool) -> Self {
+        let function = if bytes {
+            ScalarFunction::OctetLength
+        } else {
+            ScalarFunction::Length
+        };
+        Self(Expr::Call(function, vec![self.utf8_text()]))
+    }
+
+    /// Match a prefix or suffix using UTF-8 collation.
+    pub fn text_boundary(self, pattern: Self, suffix: bool) -> Self {
+        let function = if suffix {
+            ScalarFunction::EndsWith
+        } else {
+            ScalarFunction::StartsWith
+        };
+        Self(Expr::Call(
+            function,
+            vec![self.utf8_text(), pattern.utf8_text()],
+        ))
+    }
+
+    /// Join text values with a separator, optionally omitting SQL NULLs.
+    pub fn concat_text(
+        separator: Self,
+        values: impl IntoIterator<Item = Self>,
+        ignore_nulls: bool,
+    ) -> Self {
+        let values = values.into_iter().map(Self::utf8_text).collect::<Vec<_>>();
+        let separator = separator.utf8_text();
+        if ignore_nulls {
+            let array = Expr::Call(ScalarFunction::ArrayConstructCompact, values);
+            Self(Expr::Call(
+                ScalarFunction::ArrayToString,
+                vec![array, separator],
+            ))
+        } else {
+            Self(Expr::Call(
+                ScalarFunction::ConcatWs,
+                std::iter::once(separator).chain(values).collect(),
+            ))
+        }
+    }
+
+    fn utf8_text(self) -> Expr {
+        Expr::Call(ScalarFunction::CollateUtf8, vec![self.0])
     }
 
     /// Search for a substring matching a Snowflake regular expression.
@@ -145,7 +239,23 @@ impl Column {
     }
 
     pub fn try_parse_json(self) -> Self {
-        Self(Expr::TryParseJson(Box::new(self.0)))
+        Self::snowflake_call(SnowflakeFunction::TryParseJson, [self])
+    }
+
+    /// Call a supported Snowflake conversion or semi-structured-data function.
+    pub fn snowflake_call(
+        function: SnowflakeFunction,
+        args: impl IntoIterator<Item = Self>,
+    ) -> Self {
+        Self(Expr::Call(
+            ScalarFunction::Snowflake(function),
+            args.into_iter().map(|arg| arg.0).collect(),
+        ))
+    }
+
+    /// Convert a string to a Snowflake SQL type, returning SQL NULL on failure.
+    pub fn try_cast(self, target: DataType) -> Self {
+        Self(Expr::TryCast(Box::new(self.0), target))
     }
 
     pub fn sum_or_zero(self) -> Self {
@@ -372,12 +482,21 @@ pub(crate) enum Expr {
         order_by: Vec<SortKey>,
     },
     Literal(BindValue),
+    Null,
+    Case(Box<Self>, Box<Self>, Box<Self>),
+    Call(ScalarFunction, Vec<Self>),
     DateFromEpochDays(i64),
     TimestampFromEpoch(i64, TimestampUnit, bool),
     TemporalEpoch(Box<Self>, Option<DataType>),
     UtcDate(Box<Self>),
     InTimeZone(Box<Self>, String),
     TruncateTemporal(Box<Self>, TemporalBucket),
+    TruncateTemporalBy {
+        input: Box<Self>,
+        every: Box<Self>,
+        quantum_ns: u64,
+        scalar: bool,
+    },
     Minute(Box<Self>),
     ContainsText(Box<Self>, Box<Self>),
     ContainsRegex {
@@ -398,7 +517,7 @@ pub(crate) enum Expr {
     Negate(Box<Self>),
     Power(Box<Self>, Box<Self>),
     Coalesce(Box<Self>, Box<Self>),
-    TryParseJson(Box<Self>),
+    TryCast(Box<Self>, DataType),
     Not(Box<Self>),
     IsNull(Box<Self>),
     IsNotNull(Box<Self>),
@@ -412,12 +531,22 @@ impl Expr {
             | Self::RowNumber
             | Self::Over { .. }
             | Self::Literal(_)
+            | Self::Null
             | Self::DateFromEpochDays(_)
             | Self::TimestampFromEpoch(..) => false,
             Self::InList { expr, values, .. } => {
                 expr.contains_aggregate() || values.iter().any(Self::contains_aggregate)
             }
+            Self::Case(predicate, truthy, falsy) => [predicate, truthy, falsy]
+                .into_iter()
+                .any(|expr| expr.contains_aggregate()),
+            Self::Call(_, args) => args.iter().any(Self::contains_aggregate),
             Self::Binary(left, _, right)
+            | Self::TruncateTemporalBy {
+                input: left,
+                every: right,
+                ..
+            }
             | Self::Power(left, right)
             | Self::Coalesce(left, right)
             | Self::ContainsText(left, right) => {
@@ -431,7 +560,7 @@ impl Expr {
             | Self::Minute(inner)
             | Self::ContainsRegex { subject: inner, .. }
             | Self::InQuery(inner, _)
-            | Self::TryParseJson(inner)
+            | Self::TryCast(inner, _)
             | Self::Negate(inner)
             | Self::Not(inner)
             | Self::IsNull(inner)
@@ -445,13 +574,23 @@ impl Expr {
             Self::Aggregate(_)
             | Self::RowNumber
             | Self::Literal(_)
+            | Self::Null
             | Self::DateFromEpochDays(_)
             | Self::TimestampFromEpoch(..) => false,
             Self::InList { expr, values, .. } => {
                 expr.contains_ungrouped_reference()
                     || values.iter().any(Self::contains_ungrouped_reference)
             }
+            Self::Case(predicate, truthy, falsy) => [predicate, truthy, falsy]
+                .into_iter()
+                .any(|expr| expr.contains_ungrouped_reference()),
+            Self::Call(_, args) => args.iter().any(Self::contains_ungrouped_reference),
             Self::Binary(left, _, right)
+            | Self::TruncateTemporalBy {
+                input: left,
+                every: right,
+                ..
+            }
             | Self::Power(left, right)
             | Self::Coalesce(left, right)
             | Self::ContainsText(left, right) => {
@@ -465,11 +604,60 @@ impl Expr {
             | Self::Minute(inner)
             | Self::ContainsRegex { subject: inner, .. }
             | Self::InQuery(inner, _)
-            | Self::TryParseJson(inner)
+            | Self::TryCast(inner, _)
             | Self::Negate(inner)
             | Self::Not(inner)
             | Self::IsNull(inner)
             | Self::IsNotNull(inner) => inner.contains_ungrouped_reference(),
+        }
+    }
+}
+
+/// Snowflake functions with fixed SQL names and defined argument counts.
+#[derive(Clone, Copy)]
+pub enum SnowflakeFunction {
+    TryParseJson,
+    TryToNumber,
+    TypeOf,
+    GetPath,
+    IsNullValue,
+    ArrayConstruct,
+    ObjectConstructKeepNull,
+}
+
+impl SnowflakeFunction {
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::TryParseJson => "TRY_PARSE_JSON",
+            Self::TryToNumber => "TRY_TO_NUMBER",
+            Self::TypeOf => "TYPEOF",
+            Self::GetPath => "GET_PATH",
+            Self::IsNullValue => "IS_NULL_VALUE",
+            Self::ArrayConstruct => "ARRAY_CONSTRUCT",
+            Self::ObjectConstructKeepNull => "OBJECT_CONSTRUCT_KEEP_NULL",
+        }
+    }
+
+    pub fn accepts_arity(self, count: usize) -> bool {
+        match self {
+            Self::ArrayConstruct => true,
+            Self::ObjectConstructKeepNull => count.is_multiple_of(2),
+            Self::GetPath => count == 2,
+            _ => count == 1,
+        }
+    }
+
+    pub fn data_type(self) -> DataType {
+        match self {
+            Self::TryParseJson | Self::GetPath => DataType::Variant,
+            Self::TryToNumber => DataType::Number {
+                precision: 38,
+                scale: 0,
+            },
+            Self::TypeOf => DataType::Varchar,
+            Self::IsNullValue => DataType::Boolean,
+            Self::ArrayConstruct => DataType::Array,
+            Self::ObjectConstructKeepNull => DataType::Object,
         }
     }
 }
@@ -480,6 +668,11 @@ pub enum TemporalBucket {
     Day,
     Hour,
     QuarterHour,
+    Days(u64),
+    Weeks(u64),
+    Months(u64),
+    Nanoseconds(u128),
+    NaiveNanoseconds(u128),
 }
 
 #[derive(Clone, Copy)]
@@ -505,6 +698,63 @@ pub(crate) enum Aggregate {
     Count(Box<Expr>),
     Sum(Box<Expr>),
     SumOrZero(Box<Expr>),
+    Reduce(Reduction, Box<Expr>),
+}
+
+#[derive(Clone, Copy)]
+pub enum Reduction {
+    Mean,
+    Min,
+    Max,
+    All,
+    Any,
+}
+
+impl Reduction {
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            Self::Mean => "AVG",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+            Self::All => "BOOLAND_AGG",
+            Self::Any => "BOOLOR_AGG",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScalarFunction {
+    Floor,
+    NullIf,
+    LeastIgnoreNulls,
+    Length,
+    OctetLength,
+    StartsWith,
+    EndsWith,
+    ConcatWs,
+    CollateUtf8,
+    ArrayConstructCompact,
+    ArrayToString,
+    Snowflake(SnowflakeFunction),
+}
+
+impl ScalarFunction {
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            Self::Floor => "FLOOR",
+            Self::NullIf => "NULLIF",
+            Self::LeastIgnoreNulls => "LEAST_IGNORE_NULLS",
+            Self::Length => "LENGTH",
+            Self::OctetLength => "OCTET_LENGTH",
+            Self::StartsWith => "STARTSWITH",
+            Self::EndsWith => "ENDSWITH",
+            Self::ConcatWs => "CONCAT_WS",
+            Self::CollateUtf8 => "COLLATE",
+            Self::ArrayConstructCompact => "ARRAY_CONSTRUCT_COMPACT",
+            Self::ArrayToString => "ARRAY_TO_STRING",
+            Self::Snowflake(function) => function.sql(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

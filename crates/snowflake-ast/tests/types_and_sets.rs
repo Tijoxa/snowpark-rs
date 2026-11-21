@@ -1,6 +1,48 @@
 use snowflake_ast::{
-    BindValue, CompileError, DataFrame, DataType, Decimal, Field, JoinType, col, lit, lit_null,
+    BindValue, Column, CompileError, DataFrame, DataType, Decimal, Field, JoinType,
+    SnowflakeFunction, col, lit, lit_null,
 };
+
+#[test]
+fn validates_conversion_targets_and_function_arity() -> Result<(), CompileError> {
+    let source = DataFrame::table_name("entries")?;
+    let numeric = DataType::Number {
+        precision: 12,
+        scale: 4,
+    };
+    let query = source.select([lit("10.75").try_cast(numeric).alias("value")]);
+    let compiled = query.to_sql()?;
+    assert!(
+        compiled
+            .sql
+            .starts_with("SELECT TRY_CAST(? AS NUMBER(12,4))")
+    );
+    assert_eq!(compiled.binds, [BindValue::from("10.75")]);
+    let field = &query.schema()?.unwrap()[0];
+    assert_eq!(
+        (field.data_type, field.nullable),
+        (Some(numeric), Some(true))
+    );
+    assert!(matches!(
+        source
+            .select([col("value").try_cast(DataType::Variant)])
+            .to_sql(),
+        Err(CompileError::InvalidDataType(_))
+    ));
+    assert!(matches!(
+        source
+            .select([Column::snowflake_call(
+                SnowflakeFunction::GetPath,
+                [col("doc")]
+            )])
+            .to_sql(),
+        Err(CompileError::InvalidFunctionArity {
+            function: "GET_PATH",
+            count: 1
+        })
+    ));
+    Ok(())
+}
 
 #[test]
 fn retains_typed_binds_and_parentheses() -> Result<(), CompileError> {

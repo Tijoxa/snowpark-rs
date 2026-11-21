@@ -4105,6 +4105,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "polars-core",
+ "polars-defs",
  "polars-plan",
  "polars-python",
  "pyo3",
