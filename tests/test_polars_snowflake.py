@@ -20,7 +20,7 @@ def snowflake_session():
     return pls.Session.builder.config("connection_name", profile).create()
 
 
-def spread_expr(nb_hours: int, period: int | pl.Expr | None = None) -> pl.Expr:
+def complex_expr(nb_hours: int, period: int | pl.Expr | None = None) -> pl.Expr:
     if period is None:
         period_expr = pl.when((pl.col("TS").dt.minute() != 0).any()).then(15).otherwise(60)
     elif isinstance(period, int):
@@ -66,9 +66,9 @@ def _group_period():
 
 
 @pytest.mark.parametrize("period", [None, 60, _group_period()], ids=["inferred", "fixed", "group"])
-def test_spread_expr_compiles_for_grouped_and_global_queries(period):
+def test_complex_expr_compiles_for_grouped_and_global_queries(period):
     source = pls.Table("DB_CH_FC.FC.PRICE")
-    expr = spread_expr(4, period)
+    expr = complex_expr(4, period)
     grouped = source.group_by(*_spread_keys()).agg(expr)
     global_ = source.select(expr)
 
@@ -147,7 +147,7 @@ def _price_fixture():
     return local, fixture
 
 
-def test_spread_expr_matches_polars_on_snowflake(snowflake_session):
+def test_complex_expr_matches_polars_on_snowflake(snowflake_session):
     to_arrow(snowflake_session, ("ALTER SESSION SET TIMEZONE = 'Europe/Paris'", []))
     local, fixture = _price_fixture()
     source = pls.Table("SNOWPARK_RS_PRICE_FIXTURE")
@@ -165,20 +165,20 @@ def test_spread_expr_matches_polars_on_snowflake(snowflake_session):
         assert_frame_equal(actual, expected, check_row_order=False)
 
     for expr in (
-        spread_expr(4),
-        spread_expr(4, 60),
-        spread_expr(4, 45),
-        spread_expr(4, _group_period()),
-        spread_expr(0),
+        complex_expr(4),
+        complex_expr(4, 60),
+        complex_expr(4, 45),
+        complex_expr(4, _group_period()),
+        complex_expr(0),
     ):
         compare(source.group_by(*keys).agg(expr), local.group_by(*keys).agg(expr))
-    compare(source.select(spread_expr(4)), local.select(spread_expr(4)))
-    compare(source.filter(pl.lit(False)).select(spread_expr(4)), local.clear().select(spread_expr(4)))
+    compare(source.select(complex_expr(4)), local.select(complex_expr(4)))
+    compare(source.filter(pl.lit(False)).select(complex_expr(4)), local.clear().select(complex_expr(4)))
 
     # The guarded Snowflake expression yields NULL for the unsupported period.
     # Polars raises when a NULL length is also used as the offset of tail().
     compare(
-        source.select(spread_expr(4, 20)),
+        source.select(complex_expr(4, 20)),
         pl.DataFrame({"VALUE": [None]}, schema={"VALUE": pl.Float64}),
     )
 

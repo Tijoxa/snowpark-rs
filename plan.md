@@ -14,7 +14,7 @@ Le moteur couvre déjà les projections, les filtres, l’agrégation, le tri, l
 - [x] **Valider l’intégration sur Snowflake.** Les tests d’intégration Rust passent et les tests Python confirment la parité avec Polars sur `PUBLIC.PUBLIC.EXAMPLE`. Un test Rust vérifie aussi que le même DataFrame utilise les tables propres à chacune des deux sessions explicites. Les tests de parité s’activent via `SNOWPARK_RS_TEST_CONNECTION`. [Tests Rust](tests/snowflake_smoke.rs) · [Tests Python](tests/test_polars_snowflake.py)
 - [x] **Ajouter les types, les schémas et les expressions de base.** Exposer `schema` et `columns`, les `NULL` typés, les décimaux exacts, `cast` et l’arithmétique. [Tests Rust](crates/snowflake-ast/tests/types_and_sets.rs) · [Tests Python](tests/test_dataframe.py)
 - [x] **Étendre les transformations relationnelles.** Ajouter `with_column`, `rename`, `distinct`, les jointures externes et les unions par position ou par nom. [Tests Rust](crates/snowflake-ast/tests/types_and_sets.rs) · [Tests Python](tests/test_dataframe.py)
-- [x] **Compiler le spread journalier via les expressions Polars.** Exécuter `spread_expr` en agrégation groupée et dans un `select()` global, sur une source au schéma de `DB_CH_FC.FC.PRICE`. [Traduction](#composition-des-expressions-polars) · [Cas de validation](#spread-journalier-avec-spread_expr)
+- [x] **Compiler le spread journalier via les expressions Polars.** Exécuter `complex_expr` en agrégation groupée et dans un `select()` global, sur une source au schéma de `DB_CH_FC.FC.PRICE`. [Traduction](#composition-des-expressions-polars) · [Cas de validation](#spread-journalier-avec-complex_expr)
 - [x] **Traduire les clés temporelles et les prédicats sur les chaînes.** Couvrir `dt.truncate()` dans les clés de groupe et `str.contains()` en projection et en filtre. [Troncature temporelle](#clés-de-groupe-temporelles-avec-dttruncate) · [Recherche dans les chaînes](#recherche-avec-strcontains)
 - [x] **Élargir la traduction Polars vers Snowflake.** Étendre `dt.truncate()` aux durées fixes et dynamiques, ajouter des opérations sur les chaînes et les séries filtrées, et exposer les conversions et fonctions semi-structurées prioritaires. [Composition](#composition-des-expressions-polars) · [Vocabulaire SQL Snowflake](#9-vocabulaire-sql-snowflake)
 - [ ] **Prototyper le cache Parquet partitionné.** Configurer `cache_dir` et `ttl` via `Session.builder`, puis activer le cache avec `to_arrow(session, partition_by=[...])` ou `to_polars(session, partition_by=[...])` sur un plan construit avec `Table` et des expressions Polars. Valider les colonnes de partitionnement, stocker les partitions sous `cache_dir / "db.schema.table"` et prévoir la lecture locale avec DataFusion. [Plan du cache](plan_caching.md)
@@ -107,7 +107,7 @@ source.filter(pl.col("ID").is_in(ids)).to_polars(session)
 - [x] **Traduire la recherche littérale.** `literal=True` accepte un motif constant lié comme paramètre ou un motif calculé par ligne. `POSITION` utilise la collation UTF-8 explicite et garantit la correspondance du motif vide sur toute chaîne non nulle. Les tests couvrent les métacaractères, la casse, les accents, les collations et les `NULL`. [Snowflake `POSITION`](https://docs.snowflake.com/en/sql-reference/functions/position) · [Tests](tests/test_polars_string_contains.py)
 - [x] **Traduire la recherche regex de sous-chaîne.** `REGEXP_INSTR(...) > 0` recherche un motif constant du sous-ensemble commun, avec prise en charge du préfixe `(?i)`. La traduction traite aussi les correspondances de longueur zéro sur un sujet vide. Un motif invalide lève une erreur en mode strict et donne `NULL` en mode non strict. Les motifs regex dynamiques et les constructions hors du sous-ensemble produisent un diagnostic explicite. Les tests couvrent les projections et les filtres. [Snowflake `REGEXP_INSTR`](https://docs.snowflake.com/en/sql-reference/functions/regexp_instr) · [Sémantique Polars de `literal` et `strict`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.str.contains.html) · [Test Snowflake](tests/test_polars_snowflake.py)
 
-### Spread journalier avec `spread_expr`
+### Spread journalier avec `complex_expr`
 
 Cette expression compile en SQL Snowflake dans `group_by(...).agg(...)` et dans `select()`. Elle combine des agrégats scalaires par groupe et des moyennes sur des séries filtrées, triées et découpées avec une longueur calculée dans le même groupe.
 
@@ -115,7 +115,7 @@ Cette expression compile en SQL Snowflake dans `group_by(...).agg(...)` et dans 
 import polars as pl
 
 
-def spread_expr(nb_hours: int, period: int | pl.Expr | None = None) -> pl.Expr:
+def complex_expr(nb_hours: int, period: int | pl.Expr | None = None) -> pl.Expr:
     if period is None:
         period_expr = pl.when((pl.col("TS").dt.minute() != 0).any()).then(15).otherwise(60)
     elif isinstance(period, int):
@@ -139,7 +139,7 @@ def spread_expr(nb_hours: int, period: int | pl.Expr | None = None) -> pl.Expr:
     return pl.when(pl.col("DIRECTION").eq("SYMMETRIC").all()).then(sym_spread).otherwise(asym_spread).alias("VALUE")
 ```
 
-- [x] **Compiler l’expression complète.** Les tests hors ligne compilent `spread_expr(4)` dans une agrégation groupée et dans un `select()` global, avec `period=None`, un entier et une expression scalaire par groupe. [Tests](tests/test_polars_snowflake.py)
+- [x] **Compiler l’expression complète.** Les tests hors ligne compilent `complex_expr(4)` dans une agrégation groupée et dans un `select()` global, avec `period=None`, un entier et une expression scalaire par groupe. [Tests](tests/test_polars_snowflake.py)
 - [x] **Tester les périodes de 20 et 45 minutes.** Le calcul valide le quotient `60 // period_expr`, qui vaut `1` pour 45 minutes. Pour 20 minutes, la condition finale produit `NULL` sur Snowflake. Polars 2.1.0 lève `ComputeError` en évaluant le décalage nul de `tail(k)`.
 
 #### Table et données de test
@@ -165,7 +165,7 @@ CREATE TABLE DB_CH_FC.FC.PRICE (
 CLUSTER BY (FORECAST_PERIOD, ZONE, MARKET, ID_MODEL, SCENARIO, VERSION);
 ```
 
-- [x] **Comparer les résultats à Polars.** Le test utilise les mêmes lignes et `spread_expr` dans les deux moteurs. Il groupe par jour, marché et zone, compare les clés, le type `FLOAT`, les `NULL` et les valeurs. Il couvre aussi le groupe global sur des entrées présentes ou vides. Le profil se configure via `SNOWPARK_RS_TEST_CONNECTION`. [Tests de parité Snowflake](tests/test_polars_snowflake.py)
+- [x] **Comparer les résultats à Polars.** Le test utilise les mêmes lignes et `complex_expr` dans les deux moteurs. Il groupe par jour, marché et zone, compare les clés, le type `FLOAT`, les `NULL` et les valeurs. Il couvre aussi le groupe global sur des entrées présentes ou vides. Le profil se configure via `SNOWPARK_RS_TEST_CONNECTION`. [Tests de parité Snowflake](tests/test_polars_snowflake.py)
 - [x] **Couvrir les cas métier.** Le test couvre `k = 4` en horaire et `k = 16` en quart d’heure pour quatre heures, les périodes fixes, dynamiques et inférées, `k = 0`, les timestamps manquants, les prix nuls et les directions nulles. Il inclut les six prix symétriques de `1` à `6`, le spread asymétrique calculé sur deux prix de chaque côté et les groupes sans assez de candidats.
 - [x] **Vérifier les changements d’heure.** Le test compare les jours locaux de 23 et de 25 heures dans `Europe/Paris`, avec une période inférée. [Sémantique de `TIMESTAMP_LTZ`](https://docs.snowflake.com/en/sql-reference/data-types-datetime)
 
