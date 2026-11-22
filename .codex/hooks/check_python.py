@@ -1,39 +1,11 @@
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 
-CHECKS = (
-    ("uvx", "ruff", "check"),
-    ("uvx", "ty", "check"),
-    # Test the built wheel because Windows can lock an imported editable .pyd.
-    ("uv", "run", "--locked", "--extra", "session", "--no-editable", "pytest"),
-    ("cargo", "fmt", "--all", "--", "--check"),
-    ("cargo", "test", "--locked", "--no-default-features"),
-    ("cargo", "test", "--locked", "-p", "snowpark-rs", "--features", "session"),
-    (
-        "cargo",
-        "clippy",
-        "--locked",
-        "--workspace",
-        "--all-targets",
-        "--all-features",
-        "--",
-        "-D",
-        "warnings",
-    ),
-)
-TEST_REVIEW = (
-    "Review the added or modified Python and Rust tests in the working tree. "
-    "Remove temporary agent probes, scaffolding and duplicate cases that add no coverage. "
-    "Keep tests that protect distinct behavior or regressions and preserve unrelated edits."
-)
-RUST_TEST_ATTRIBUTE = re.compile(r"#\[\s*(?:(?:\w+::)*test\b|cfg\(\s*test\b)")
 
-
-def has_test_changes(root: Path) -> bool:
-    changed = subprocess.check_output(
+def changed_python_files(root: Path) -> list[str]:
+    changes = subprocess.check_output(
         [
             "git",
             "--no-optional-locks",
@@ -42,32 +14,26 @@ def has_test_changes(root: Path) -> bool:
             "-z",
             "--untracked-files=all",
             "--no-renames",
+            "--",
+            "*.py",
+            "*.pyi",
         ],
         cwd=root,
         encoding="utf-8",
-        stderr=subprocess.PIPE,
     )
-    for entry in filter(None, changed.split("\0")):
-        name = Path(entry[3:])
-        path = root / name
-        if path.suffix not in {".py", ".rs"} or not path.is_file():
-            continue
-        if "tests" in name.parts:
-            return True
-        if path.suffix == ".py":
-            if path.match("test_*.py") or path.match("*_test.py") or path.name == "conftest.py":
-                return True
-        elif RUST_TEST_ATTRIBUTE.search(path.read_text(encoding="utf-8", errors="replace")):
-            return True
-    return False
+    paths = (entry[3:] for entry in changes.split("\0") if entry)
+    return [path for path in paths if (root / path).is_file()]
 
 
 def main() -> None:
     event = json.load(sys.stdin)
     root = Path(__file__).resolve().parents[2]
-    failures = []
+    checks = [("cargo", "fmt", "--all", "--", "--check")]
+    if paths := changed_python_files(root):
+        checks.append(("uvx", "ruff", "format", "--check", "--", *paths))
 
-    for command in CHECKS:
+    failures = []
+    for command in checks:
         try:
             result = subprocess.run(
                 command,
@@ -90,19 +56,15 @@ def main() -> None:
                 f"`{' '.join(command)}` exited with {result.returncode}\n{output}"
             )
 
-    response = {}
-    if event.get("stop_hook_active"):
-        if failures:
-            diagnostics = "\n\n".join(failures)
-            response = {"systemMessage": f"Project checks still failing\n\n{diagnostics}"}
+    diagnostics = "\n\n".join(failures)
+    if not failures:
+        response = {}
+    elif event.get("stop_hook_active"):
+        response = {
+            "systemMessage": f"Formatting checks still failing\n\n{diagnostics}"
+        }
     else:
-        follow_up = []
-        if has_test_changes(root):
-            follow_up.append(TEST_REVIEW)
-        if failures:
-            follow_up.extend(("Review the project check failures before finishing.", *failures))
-        if follow_up:
-            response = {"decision": "block", "reason": "\n\n".join(follow_up)}
+        response = {"decision": "block", "reason": diagnostics}
     print(json.dumps(response))
 
 

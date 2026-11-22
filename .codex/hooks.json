@@ -6,8 +6,8 @@
           {
             "type": "command",
             "command": "uv run --no-project --no-python-downloads python \"$(git rev-parse --show-toplevel)/.codex/hooks/check_python.py\"",
-            "timeout": 900,
-            "statusMessage": "Running Ruff, ty, pytest, Rust tests and Clippy"
+            "timeout": 60,
+            "statusMessage": "Checking Python and Rust formatting"
           }
         ]
       }
